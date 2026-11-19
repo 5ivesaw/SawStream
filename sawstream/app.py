@@ -1,3 +1,4 @@
+import argparse
 import os
 import random
 import re
@@ -23,7 +24,12 @@ from textual.widgets import (
 )
 
 from sawstream import __version__
-from sawstream.artwork import idle_artwork, render_thumbnail
+from sawstream.artwork import (
+    idle_artwork,
+    mini_idle_artwork,
+    render_mini_thumbnail,
+    render_thumbnail,
+)
 from sawstream.engine import HeadlessMPV
 from sawstream.mirrors import (
     extract_media_in_process,
@@ -59,6 +65,7 @@ from sawstream.storage import (
     scan_offline_library,
     toggle_favorite,
 )
+from sawstream.visualizer import STYLES as VIS_STYLES, AudioVisualizerEngine, render_visualizer
 
 BANNER = r"""
  ███████╗ █████╗ ██╗    ██╗███████╗████████╗██████╗ ███████╗ █████╗ ███╗   ███╗
@@ -88,6 +95,7 @@ class SawStreamApp(App):
     Tab.-active { color: #000000; background: #ff2e43; text-style: bold; }
     Underline > .underline--bar { color: #ff2e43; }
 
+    /* Full Mode Deck */
     #np-top { height: 18; margin: 1 1 0 1; }
     #np-thumb { width: 40; height: 18; border: solid #ff2e43; background: #050507; padding: 0 1; }
     #np-meta-box { width: 1fr; height: 18; border: solid #222228; background: #070709; padding: 1 2; margin-left: 1; }
@@ -100,6 +108,67 @@ class SawStreamApp(App):
     #np-controls { height: 3; margin-top: 1; align: left middle; }
     #queue-header { height: 3; margin: 1 1 0 1; align: left middle; }
     #queue-label { color: #ff2e43; text-style: bold; width: 1fr; padding-top: 1; }
+
+    /* Minimal Spotify + Visualizer Mode */
+    #minimal-view { display: none; height: 1fr; background: #000000; }
+    #minimal-view.active { display: block; }
+    .hidden-in-minimal { display: none; }
+
+    #min-vis {
+        height: 1fr;
+        width: 1fr;
+        background: #000000;
+        padding: 0 1;
+    }
+    #min-quick {
+        display: none;
+        height: 3;
+        margin: 0 2;
+        background: #0d0d10;
+        border: tall #ff2e43;
+        color: #ffffff;
+    }
+    #min-quick.open { display: block; }
+    #min-bar {
+        height: 9;
+        background: #09090c;
+        border-top: solid #26262e;
+        padding: 1 2;
+        align: left middle;
+    }
+    #min-thumb {
+        width: 16;
+        height: 7;
+        background: #050507;
+        padding: 0 1;
+    }
+    #min-meta {
+        width: 1fr;
+        height: 7;
+        margin-left: 2;
+    }
+    #min-title {
+        color: #ffffff;
+        text-style: bold;
+        height: 1;
+    }
+    #min-author {
+        color: #ff5566;
+        height: 1;
+    }
+    #min-progress {
+        width: 1fr;
+        margin-top: 1;
+    }
+    #min-info {
+        color: #a1a8b3;
+        height: 1;
+    }
+    #min-hints {
+        color: #5a606c;
+        height: 1;
+        margin-top: 1;
+    }
 
     .toolbar { height: 3; margin: 1 1 0 1; align: left middle; }
     .actions { height: 3; margin: 0 1 1 1; align: left middle; }
@@ -120,6 +189,10 @@ class SawStreamApp(App):
 
     BINDINGS = [
         ("q", "quit", "Quit"),
+        ("v", "toggle_minimal", "Minimal Mode"),
+        ("b", "cycle_vis_style", "Vis Style"),
+        ("/", "open_quick_play", "Quick Play"),
+        ("escape", "close_quick_play", "Close Input"),
         ("space", "toggle_pause", "Play/Pause"),
         ("n", "next_track", "Next"),
         ("p", "prev_track", "Prev"),
@@ -142,15 +215,23 @@ class SawStreamApp(App):
         ("8", "switch_tab('tab-mirrors')", "Mirrors"),
     ]
 
-    def __init__(self):
+    def __init__(self, start_minimal: bool = False, initial_target: str = ""):
         super().__init__()
         ensure_dirs()
         cleanup_stale_partials()
         self.settings = load_settings()
         self.mpv = HeadlessMPV(initial_volume=self.settings.get("volume", 100))
+        self.vis = AudioVisualizerEngine(num_bands=48)
+        self.minimal_mode = start_minimal
+        self.initial_target = initial_target
+        self.vis_style = self.settings.get("vis_style", "BARS")
+        if self.vis_style not in VIS_STYLES:
+            self.vis_style = "BARS"
+
         self.queue: list[dict] = []
         self.queue_idx: int = -1
         self.is_loading_track = False
+        self.is_playing_audio = False
         self.current_source_tag = "IDLE"
         self.last_progress_ratio = 0.0
         self._busy_count = 0
@@ -176,21 +257,29 @@ class SawStreamApp(App):
     def _begin_work(self, msg: str) -> None:
         self._busy_count += 1
         self.query_one("#status-bar", Static).update(msg)
-        self.query_one("#loader", LoadingIndicator).add_class("active")
+        if not self.minimal_mode:
+            self.query_one("#loader", LoadingIndicator).add_class("active")
+        else:
+            self.query_one("#min-info", Static).update(msg[:90])
 
     def _end_work(self, msg: str = "") -> None:
         self._busy_count = max(0, self._busy_count - 1)
         if msg:
             self.query_one("#status-bar", Static).update(msg)
+            if self.minimal_mode and self.queue_idx < 0:
+                self.query_one("#min-info", Static).update(msg[:90])
         if self._busy_count == 0:
             self.query_one("#loader", LoadingIndicator).remove_class("active")
 
     def set_status(self, text: str) -> None:
         self.query_one("#status-bar", Static).update(text)
+        if self.minimal_mode:
+            self.query_one("#min-info", Static).update(text[:90])
 
     def compose(self) -> ComposeResult:
+        # --- FULL MODE CHROME ---
         yield Static(BANNER, id="banner")
-        yield Static(f"SAWSTREAM v{__version__} BY 5SAW  |  KEYS 1-8 TABS  |  SPACE PAUSE", id="status-bar")
+        yield Static(f"SAWSTREAM v{__version__} BY 5SAW  |  KEYS 1-8 TABS  |  [v] MINIMAL VISUALIZER  |  [Space] PAUSE", id="status-bar")
         yield LoadingIndicator(id="loader")
 
         with TabbedContent(id="tabs"):
@@ -211,12 +300,13 @@ class SawStreamApp(App):
                             yield Button("-10s", id="ctl-back")
                             yield Button("+10s", id="ctl-fwd")
                             yield Button(self._rep_lbl(), id="ctl-repeat")
-                            yield Button("FAV", id="ctl-fav")
+                            yield Button("MINIMAL", id="ctl-minimal", classes="primary")
                             yield Button(self._lbl("auto_save_music", "SAVE"), id="ctl-save-music", classes="on" if self.settings["auto_save_music"] else "")
                 with Horizontal(id="queue-header"):
                     yield Static("UP NEXT QUEUE (ENTER TO JUMP)", id="queue-label")
                     yield Button("SHUFFLE", id="q-shuffle")
                     yield Button("FAVORITES", id="q-favs")
+                    yield Button("FAV", id="ctl-fav")
                     yield Button("REMOVE", id="q-del")
                     yield Button("CLEAR", id="q-clear")
                 yield DataTable(id="queue-table", cursor_type="row")
@@ -301,6 +391,22 @@ class SawStreamApp(App):
 
         yield Footer()
 
+        # --- MINIMAL VISUALIZER + SPOTIFY-LIKE BAR ---
+        with Vertical(id="minimal-view"):
+            yield Static("", id="min-vis")
+            yield Input(
+                placeholder="Quick Play: type a song name OR paste YouTube / Spotify / Playlist URL (Esc to close)...",
+                id="min-quick",
+            )
+            with Horizontal(id="min-bar"):
+                yield Static(mini_idle_artwork(), id="min-thumb")
+                with Vertical(id="min-meta"):
+                    yield Static("Nothing Playing", id="min-title")
+                    yield Static("Press [/] to play a song, or [v] to open Full Mode", id="min-author")
+                    yield ProgressBar(total=100, show_eta=False, show_percentage=False, id="min-progress")
+                    yield Static("0:00 / 0:00  ·  IDLE", id="min-info")
+                    yield Static("[v] Full  [b] Style  [/] Play  [Space] Pause  [n/p] Skip  [s] Save  [f] Fav  [-/=] Vol  [q] Quit", id="min-hints")
+
     def on_mount(self) -> None:
         self.query_one("#queue-table", DataTable).add_columns("#", "TRACK TITLE", "AUTHOR", "DURATION")
         self.query_one("#yt-table", DataTable).add_columns("TITLE", "CHANNEL", "DURATION")
@@ -312,11 +418,81 @@ class SawStreamApp(App):
         self.query_one("#mirror-table", DataTable).add_columns("SERVICE", "MIRROR ENDPOINT", "STATUS", "LATENCY")
 
         self.set_interval(0.35, self.poll_player)
+        self.set_interval(0.06, self.tick_visualizer)
         self.refresh_offline_table()
+        if self.minimal_mode:
+            self._apply_minimal_mode(True)
+        if self.initial_target:
+            self.load_and_play_url(self.initial_target)
 
     def on_unmount(self) -> None:
         self.scrape_cancel.set()
+        self.vis.stop()
         self.mpv.shutdown()
+
+    # --- MINIMAL MODE & REAL-TIME VISUALIZER ---
+    def _apply_minimal_mode(self, enabled: bool) -> None:
+        self.minimal_mode = enabled
+        chrome_ids = ("#banner", "#status-bar", "#loader", "#tabs")
+        for cid in chrome_ids:
+            w = self.query_one(cid)
+            w.add_class("hidden-in-minimal") if enabled else w.remove_class("hidden-in-minimal")
+        footer = self.query_one(Footer)
+        footer.add_class("hidden-in-minimal") if enabled else footer.remove_class("hidden-in-minimal")
+
+        mv = self.query_one("#minimal-view")
+        if enabled:
+            mv.add_class("active")
+            self.vis.start()
+            self.set_focus(None)
+        else:
+            mv.remove_class("active")
+            self.query_one("#min-quick", Input).remove_class("open")
+            self.vis.stop()
+
+    def action_toggle_minimal(self) -> None:
+        if isinstance(self.focused, Input):
+            return
+        self._apply_minimal_mode(not self.minimal_mode)
+
+    def action_cycle_vis_style(self) -> None:
+        if isinstance(self.focused, Input):
+            return
+        idx = (VIS_STYLES.index(self.vis_style) + 1) % len(VIS_STYLES)
+        self.vis_style = VIS_STYLES[idx]
+        self.settings["vis_style"] = self.vis_style
+        save_settings(self.settings)
+        if not self.minimal_mode:
+            self.set_status(f"VISUALIZER STYLE: {self.vis_style} (Press 'v' for Minimal Mode)")
+
+    def action_open_quick_play(self) -> None:
+        if isinstance(self.focused, Input):
+            return
+        if self.minimal_mode:
+            inp = self.query_one("#min-quick", Input)
+            inp.add_class("open")
+            inp.focus()
+        else:
+            self.action_switch_tab("tab-music")
+            self.query_one("#music-input", Input).focus()
+
+    def action_close_quick_play(self) -> None:
+        inp = self.query_one("#min-quick", Input)
+        if inp.has_class("open"):
+            inp.remove_class("open")
+            inp.value = ""
+        self.set_focus(None)
+
+    def tick_visualizer(self) -> None:
+        if not self.minimal_mode:
+            return
+        vis_widget = self.query_one("#min-vis", Static)
+        w = max(24, vis_widget.size.width - 2)
+        h = max(6, vis_widget.size.height)
+        levels, peaks, live_pcm = self.vis.step_levels(self.is_playing_audio)
+        src = "LIVE PCM" if live_pcm else ("WAVE" if self.is_playing_audio else "IDLE")
+        tag = f"SAWSTREAM · {self.vis_style} · {src}"
+        vis_widget.update(render_visualizer(levels, peaks, width=w, height=h, style_name=self.vis_style, header_tag=tag))
 
     @on(TabbedContent.TabActivated)
     def on_tab_activated(self, event: TabbedContent.TabActivated) -> None:
@@ -364,9 +540,11 @@ class SawStreamApp(App):
 
     def poll_player(self) -> None:
         if self.queue_idx < 0 or self.is_loading_track:
+            self.is_playing_audio = False
             return
         st = self.mpv.snapshot_state()
         if st.get("idle") is True:
+            self.is_playing_audio = False
             completed = self.last_progress_ratio >= 0.85
             if self.mpv.finalize_recording(completed=completed):
                 self.refresh_offline_table()
@@ -382,6 +560,7 @@ class SawStreamApp(App):
             else:
                 self.query_one("#np-tech", Static).update(f"FINISHED  |  Queue: {self.queue_idx + 1} / {len(self.queue)}")
                 self.query_one("#np-eq", Static).update("▁" * 44)
+                self.query_one("#min-info", Static).update(f"FINISHED  ·  Queue {self.queue_idx + 1}/{len(self.queue)}")
             return
 
         pos = float(st.get("pos") or 0.0)
@@ -391,6 +570,8 @@ class SawStreamApp(App):
 
         paused = st.get("paused", False)
         muted = st.get("muted", False)
+        self.is_playing_audio = not (paused or muted)
+
         vol = int(st.get("vol")) if st.get("vol") is not None else self.settings.get("volume", 100)
         cache = int(st.get("cache") or 0)
         kbps = int((st.get("bitrate") or 0) / 1000)
@@ -398,18 +579,30 @@ class SawStreamApp(App):
 
         state_str = "PAUSED" if paused else "PLAYING"
         vol_str = "MUTED" if muted else f"{vol}%"
+        time_str = f"{fmt_dur(pos)} / {fmt_dur(dur)}"
+
+        # Update Full Deck widgets
         tech_parts = [f"{state_str} [{self.current_source_tag}]", f"Queue {self.queue_idx + 1}/{len(self.queue)}", f"Vol {vol_str}"]
         if codec:
             tech_parts.append(f"{codec} {kbps}k" if kbps else codec)
         if cache > 0 and self.current_source_tag != "OFFLINE":
             tech_parts.append(f"Buf {cache}s")
         self.query_one("#np-tech", Static).update("  |  ".join(tech_parts))
-        self.query_one("#np-time", Static).update(f"{fmt_dur(pos)} / {fmt_dur(dur)}")
+        self.query_one("#np-time", Static).update(time_str)
         if dur > 0:
             self.query_one("#np-progress", ProgressBar).update(total=dur, progress=min(pos, dur))
-        self.query_one("#np-eq", Static).update("▁" * 44 if (paused or muted) else "".join(EQ_BLOCKS[random.randint(1, len(EQ_BLOCKS) - 1)] for _ in range(44)))
+        if not self.minimal_mode:
+            self.query_one("#np-eq", Static).update("▁" * 44 if (paused or muted) else "".join(EQ_BLOCKS[random.randint(1, len(EQ_BLOCKS) - 1)] for _ in range(44)))
 
-    # --- YOUTUBE / MUSIC / URL WORKERS (ALL WITH TRY/FINALLY SO LOADER NEVER STALLS) ---
+        # Update Minimal Spotify-like Bar
+        save_tag = "AUTO-SAVE" if self.settings.get("auto_save_music") else "STREAM ONLY"
+        self.query_one("#min-info", Static).update(
+            f"{time_str}   ·   {state_str} [{self.current_source_tag}]   ·   {self.queue_idx + 1}/{len(self.queue)}   ·   Vol {vol_str}   ·   {save_tag}"
+        )
+        if dur > 0:
+            self.query_one("#min-progress", ProgressBar).update(total=dur, progress=min(pos, dur))
+
+    # --- WORKERS ---
     @work(thread=True, group="yt", exclusive=True)
     def load_yt(self, query: str):
         self.call_from_thread(self._begin_work, f"LOADING YOUTUBE: {query or 'HOME'}...")
@@ -511,8 +704,42 @@ class SawStreamApp(App):
             self.call_from_thread(self._end_work, msg)
 
     @work(thread=True, group="load_url", exclusive=True)
-    def load_and_play_url(self, url: str, append_only: bool = False):
-        url = normalize_url(url)
+    def load_and_play_url(self, raw_input: str, append_only: bool = False):
+        raw_input = raw_input.strip()
+        if not raw_input:
+            return
+        # Support direct song-name search from Quick Play bar in Minimal Mode!
+        if not is_url(raw_input):
+            self.call_from_thread(self._begin_work, f"QUICK SEARCH: {raw_input}...")
+            msg = ""
+            try:
+                rows, _ = fetch_yt_feed(raw_input, music_only=True)
+                if not rows:
+                    msg = f"NO SONG FOUND FOR '{raw_input}'."
+                    return
+                tracks = [
+                    {
+                        "id": extract_vid_id(r[3]),
+                        "title": r[0],
+                        "author": r[1],
+                        "duration": 0,
+                        "thumbnail": f"https://i.ytimg.com/vi/{extract_vid_id(r[3])}/hqdefault.jpg",
+                        "webpage_url": r[3],
+                    }
+                    for r in rows[:15]
+                ]
+                self.queue = tracks
+                if not self.minimal_mode:
+                    self.call_from_thread(self.action_switch_tab, "tab-np")
+                self.call_from_thread(self.play_queue_index, 0)
+                msg = f"QUEUED {len(tracks)} TRACKS FOR '{raw_input}'"
+            except Exception as e:
+                msg = f"QUICK SEARCH ERROR: {e}"
+            finally:
+                self.call_from_thread(self._end_work, msg)
+            return
+
+        url = normalize_url(raw_input)
         vid_id = extract_vid_id(url)
         if vid_id and "list=" not in url and "open.spotify.com" not in url:
             local_file = find_offline_file(MUSIC_DIR, vid_id=vid_id)
@@ -525,7 +752,8 @@ class SawStreamApp(App):
                     self.call_from_thread(self.set_status, f"QUEUED OFFLINE: {clean}")
                 else:
                     self.queue = [track]
-                    self.call_from_thread(self.action_switch_tab, "tab-np")
+                    if not self.minimal_mode:
+                        self.call_from_thread(self.action_switch_tab, "tab-np")
                     self.call_from_thread(self.play_queue_index, 0)
                 return
 
@@ -542,7 +770,8 @@ class SawStreamApp(App):
                 msg = f"QUEUED {len(tracks)} TRACK(S)."
                 return
             self.queue = tracks
-            self.call_from_thread(self.action_switch_tab, "tab-np")
+            if not self.minimal_mode:
+                self.call_from_thread(self.action_switch_tab, "tab-np")
             self.call_from_thread(self.play_queue_index, 0)
             msg = f"LOADED {len(tracks)} TRACK(S)."
         except Exception as e:
@@ -566,21 +795,29 @@ class SawStreamApp(App):
 
             self.call_from_thread(self.refresh_queue_table)
             self.call_from_thread(self.query_one("#np-title", Static).update, f"Loading: {item['title'][:65]}...")
+            self.call_from_thread(self.query_one("#min-title", Static).update, f"Loading: {item['title'][:65]}...")
 
-            # STRICT offline check: ONLY exact local_path or exact [vid_id] match (NEVER random substring!)
             local_path = item.get("local_path") or (find_offline_file(MUSIC_DIR, vid_id=vid_id) if vid_id else None)
             if local_path and os.path.exists(local_path):
                 self.current_source_tag = "OFFLINE"
-                thumb_render = render_thumbnail(item.get("thumbnail", ""), vid_id=vid_id)
+                thumb_full = render_thumbnail(item.get("thumbnail", ""), vid_id=vid_id)
+                thumb_mini = render_mini_thumbnail(item.get("thumbnail", ""), vid_id=vid_id)
                 if self.mpv.play_source(local_path, prev_completed=prev_completed):
                     self.call_from_thread(self.refresh_offline_table)
                 record_history(item)
+                self.is_playing_audio = True
+
                 def update_offline_ui():
-                    self.query_one("#np-thumb", Static).update(thumb_render)
+                    self.query_one("#np-thumb", Static).update(thumb_full)
                     self.query_one("#np-title", Static).update(item["title"][:72])
                     self.query_one("#np-author", Static).update(f"Author: {item['author']}  ·  {Path(local_path).name[:30]}")
                     self.query_one("#np-progress", ProgressBar).update(total=float(item.get("duration") or 100), progress=0)
+                    self.query_one("#min-thumb", Static).update(thumb_mini)
+                    self.query_one("#min-title", Static).update(item["title"][:78])
+                    self.query_one("#min-author", Static).update(item["author"][:60])
+                    self.query_one("#min-progress", ProgressBar).update(total=float(item.get("duration") or 100), progress=0)
                     self.refresh_queue_table()
+
                 self.call_from_thread(update_offline_ui)
                 msg = f"[OFFLINE] {item['title'][:58]}"
                 return
@@ -599,17 +836,24 @@ class SawStreamApp(App):
             else:
                 self.current_source_tag = "STREAM"
 
-            thumb_render = render_thumbnail(resolved["thumbnail"], vid_id=vid_id)
+            thumb_full = render_thumbnail(resolved["thumbnail"], vid_id=vid_id)
+            thumb_mini = render_mini_thumbnail(resolved["thumbnail"], vid_id=vid_id)
             if self.mpv.play_source(resolved["stream_url"], partial_path=partial_path, final_path=final_path, prev_completed=prev_completed):
                 self.call_from_thread(self.refresh_offline_table)
             record_history(resolved)
+            self.is_playing_audio = True
 
             def update_ui():
-                self.query_one("#np-thumb", Static).update(thumb_render)
+                self.query_one("#np-thumb", Static).update(thumb_full)
                 self.query_one("#np-title", Static).update(resolved["title"][:72])
                 self.query_one("#np-author", Static).update(f"Author: {resolved['author']}")
                 self.query_one("#np-progress", ProgressBar).update(total=float(resolved["duration"] or 100), progress=0)
+                self.query_one("#min-thumb", Static).update(thumb_mini)
+                self.query_one("#min-title", Static).update(resolved["title"][:78])
+                self.query_one("#min-author", Static).update(resolved["author"][:60])
+                self.query_one("#min-progress", ProgressBar).update(total=float(resolved["duration"] or 100), progress=0)
                 self.refresh_queue_table()
+
             self.call_from_thread(update_ui)
             msg = f"PLAYING: {resolved['title'][:50]}{' (Auto-saving)' if partial_path else ''}"
         except Exception as e:
@@ -618,7 +862,6 @@ class SawStreamApp(App):
             self.is_loading_track = False
             self.call_from_thread(self._end_work, msg)
 
-    # --- LIVE-STREAMING CHANNEL SCRAPER WORKER ---
     @work(thread=True, group="scraper", exclusive=True)
     def run_scrape(self, raw: str, playlists_only: bool = True):
         self.scrape_cancel.clear()
@@ -703,7 +946,6 @@ class SawStreamApp(App):
         finally:
             self.call_from_thread(self._end_work, msg)
 
-    # --- VIDEO / ANIME / MOVIE LAUNCHERS (USES VENV YT-DLP + STRICT ID MATCH) ---
     def spawn_detached_video(self, url: str, title: str = "") -> None:
         url = normalize_url(url)
         vid_id = extract_vid_id(url)
@@ -713,12 +955,7 @@ class SawStreamApp(App):
             self.set_status(f"[OFFLINE VIDEO] {Path(local_vid).name}")
             return
 
-        cmd = [
-            "mpv",
-            "--no-terminal",
-            "--really-quiet",
-            f"--script-opts=ytdl_hook-ytdl_path={venv_ytdlp_path()}",
-        ]
+        cmd = ["mpv", "--no-terminal", "--really-quiet", f"--script-opts=ytdl_hook-ytdl_path={venv_ytdlp_path()}"]
         if self.settings.get("auto_save_video") and vid_id:
             out_path = str(VIDEO_DIR / f"{sanitize_filename(title or vid_id)} [{vid_id}].mkv")
             cmd.append(f"--stream-record={out_path}")
@@ -762,6 +999,10 @@ class SawStreamApp(App):
 
     # --- ACTIONS ---
     def action_switch_tab(self, tab_id: str) -> None:
+        if isinstance(self.focused, Input):
+            return
+        if self.minimal_mode:
+            self._apply_minimal_mode(False)
         self.query_one("#tabs", TabbedContent).active = tab_id
 
     def action_toggle_pause(self) -> None:
@@ -769,31 +1010,38 @@ class SawStreamApp(App):
             self.mpv.toggle_pause()
 
     def action_toggle_mute(self) -> None:
-        self.mpv.toggle_mute()
+        if not isinstance(self.focused, Input):
+            self.mpv.toggle_mute()
 
     def action_next_track(self) -> None:
-        if self.queue_idx + 1 < len(self.queue):
+        if not isinstance(self.focused, Input) and self.queue_idx + 1 < len(self.queue):
             self.play_queue_index(self.queue_idx + 1)
 
     def action_prev_track(self) -> None:
-        if self.queue_idx - 1 >= 0:
+        if not isinstance(self.focused, Input) and self.queue_idx - 1 >= 0:
             self.play_queue_index(self.queue_idx - 1)
 
     def action_seek_back(self) -> None:
-        self.mpv.seek(-10)
+        if not isinstance(self.focused, Input):
+            self.mpv.seek(-10)
 
     def action_seek_fwd(self) -> None:
-        self.mpv.seek(10)
+        if not isinstance(self.focused, Input):
+            self.mpv.seek(10)
 
     def action_vol_down(self) -> None:
-        self.settings["volume"] = self.mpv.adjust_volume(-5)
-        save_settings(self.settings)
+        if not isinstance(self.focused, Input):
+            self.settings["volume"] = self.mpv.adjust_volume(-5)
+            save_settings(self.settings)
 
     def action_vol_up(self) -> None:
-        self.settings["volume"] = self.mpv.adjust_volume(5)
-        save_settings(self.settings)
+        if not isinstance(self.focused, Input):
+            self.settings["volume"] = self.mpv.adjust_volume(5)
+            save_settings(self.settings)
 
     def action_cycle_repeat(self) -> None:
+        if isinstance(self.focused, Input):
+            return
         modes = ["OFF", "ALL", "ONE"]
         nxt = modes[(modes.index(self.settings.get("repeat_mode", "OFF")) + 1) % len(modes)]
         self.settings["repeat_mode"] = nxt
@@ -802,7 +1050,7 @@ class SawStreamApp(App):
         self.set_status(f"REPEAT: {nxt}")
 
     def action_shuffle_queue(self) -> None:
-        if len(self.queue) <= 1:
+        if isinstance(self.focused, Input) or len(self.queue) <= 1:
             return
         current = self.queue[self.queue_idx] if 0 <= self.queue_idx < len(self.queue) else None
         rest = [x for i, x in enumerate(self.queue) if i != self.queue_idx]
@@ -813,11 +1061,15 @@ class SawStreamApp(App):
         self.set_status("QUEUE SHUFFLED.")
 
     def action_favorite_current(self) -> None:
+        if isinstance(self.focused, Input):
+            return
         if 0 <= self.queue_idx < len(self.queue):
             added = toggle_favorite(self.queue[self.queue_idx])
             self.set_status(f"{'FAVORITED' if added else 'UNFAVORITED'}: {self.queue[self.queue_idx]['title'][:45]}")
 
     def action_toggle_save(self, key: str) -> None:
+        if isinstance(self.focused, Input):
+            return
         self.settings[key] = not self.settings.get(key, False)
         save_settings(self.settings)
         btn_map = {
@@ -838,16 +1090,15 @@ class SawStreamApp(App):
             self.set_status("NO OFFLINE SONGS IN ~/Music YET.")
             return
         self.queue = tracks
-        self.action_switch_tab("tab-np")
+        if not self.minimal_mode:
+            self.action_switch_tab("tab-np")
         self.play_queue_index(0)
 
     def _get_yt_selected_or_pasted(self) -> tuple[str, str]:
-        """If the user selected a row use it; if they pasted a URL in the box and table doesn't match, use the pasted URL."""
         pasted = self.query_one("#yt-input", Input).value.strip()
         t = self.query_one("#yt-table", DataTable)
         if self.yt_rows and 0 <= t.cursor_row < len(self.yt_rows):
             title, _, _, url = self.yt_rows[t.cursor_row]
-            # If user pasted a direct URL that isn't loaded into the table yet, prioritize the pasted URL!
             if is_url(pasted) and extract_vid_id(pasted) and extract_vid_id(pasted) != extract_vid_id(url):
                 return pasted, normalize_url(pasted)
             return title, url
@@ -858,13 +1109,24 @@ class SawStreamApp(App):
     def _play_offline_item(self, item: dict) -> None:
         if item["kind"] == "MUSIC":
             self.queue = [item]
-            self.action_switch_tab("tab-np")
+            if not self.minimal_mode:
+                self.action_switch_tab("tab-np")
             self.play_queue_index(0)
         else:
             subprocess.Popen(["mpv", "--no-terminal", "--really-quiet", item["local_path"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.set_status(f"[OFFLINE {item['kind']}] {item['title'][:50]}")
 
     # --- INPUTS ---
+    @on(Input.Submitted, "#min-quick")
+    def on_min_quick_submit(self, event: Input.Submitted):
+        val = event.value.strip()
+        inp = self.query_one("#min-quick", Input)
+        inp.value = ""
+        inp.remove_class("open")
+        self.set_focus(None)
+        if val:
+            self.load_and_play_url(val)
+
     @on(Input.Submitted, "#yt-input")
     def on_yt_submit(self, event: Input.Submitted):
         self.load_yt(event.value.strip())
@@ -902,6 +1164,7 @@ class SawStreamApp(App):
         elif bid == "ctl-back": self.action_seek_back()
         elif bid == "ctl-fwd": self.action_seek_fwd()
         elif bid == "ctl-repeat": self.action_cycle_repeat()
+        elif bid == "ctl-minimal": self._apply_minimal_mode(True)
         elif bid == "ctl-fav": self.action_favorite_current()
         elif bid == "ctl-save-music": self.action_toggle_save("auto_save_music")
         elif bid == "ctl-save-video": self.action_toggle_save("auto_save_video")
@@ -927,11 +1190,16 @@ class SawStreamApp(App):
             self.mpv.stop()
             self.queue = []
             self.queue_idx = -1
+            self.is_playing_audio = False
             self.refresh_queue_table()
             self.query_one("#np-thumb", Static).update(idle_artwork())
             self.query_one("#np-title", Static).update("Nothing Playing")
             self.query_one("#np-author", Static).update("Author: --")
             self.query_one("#np-eq", Static).update("▁" * 44)
+            self.query_one("#min-thumb", Static).update(mini_idle_artwork())
+            self.query_one("#min-title", Static).update("Nothing Playing")
+            self.query_one("#min-author", Static).update("Press [/] to play a song, or [v] to open Full Mode")
+            self.query_one("#min-info", Static).update("0:00 / 0:00  ·  IDLE")
         elif bid == "yt-search":
             self.load_yt(self.query_one("#yt-input", Input).value.strip())
         elif bid == "yt-home":
@@ -1050,4 +1318,10 @@ class SawStreamApp(App):
 
 
 def main() -> None:
-    SawStreamApp().run()
+    parser = argparse.ArgumentParser(prog="sawstream", description="SawStream Terminal Media Hub")
+    parser.add_argument("-m", "--minimal", action="store_true", help="Start directly in Minimal Visualizer mode")
+    parser.add_argument("target", nargs="?", default="", help="Optional song query or URL to start playing immediately")
+    args = parser.parse_args()
+
+    app = SawStreamApp(start_minimal=args.minimal, initial_target=args.target)
+    app.run()

@@ -31,6 +31,7 @@ DEFAULT_SETTINGS = {
     "auto_save_movies": False,
     "volume": 100,
     "repeat_mode": "OFF",
+    "vis_style": "BARS",
 }
 
 
