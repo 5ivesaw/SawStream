@@ -224,14 +224,15 @@ class SawStreamApp(App):
         self.vis = AudioVisualizerEngine(num_bands=48)
         self.minimal_mode = start_minimal
         self.initial_target = initial_target
-        self.vis_style = self.settings.get("vis_style", "BARS")
+        self.vis_style = self.settings.get("vis_style", "SPEAK")
         if self.vis_style not in VIS_STYLES:
-            self.vis_style = "BARS"
+            self.vis_style = "SPEAK"
 
         self.queue: list[dict] = []
         self.queue_idx: int = -1
         self.is_loading_track = False
         self.is_playing_audio = False
+        self._vis_idle_drawn = False
         self.current_source_tag = "IDLE"
         self.last_progress_ratio = 0.0
         self._busy_count = 0
@@ -278,21 +279,21 @@ class SawStreamApp(App):
 
     def compose(self) -> ComposeResult:
         # --- FULL MODE CHROME ---
-        yield Static(BANNER, id="banner")
-        yield Static(f"SAWSTREAM v{__version__} BY 5SAW  |  KEYS 1-8 TABS  |  [v] MINIMAL VISUALIZER  |  [Space] PAUSE", id="status-bar")
+        yield Static(BANNER, id="banner", markup=False)
+        yield Static(f"SAWSTREAM v{__version__} BY 5SAW  |  KEYS 1-8 TABS  |  [v] MINIMAL VISUALIZER  |  [Space] PAUSE", id="status-bar", markup=False)
         yield LoadingIndicator(id="loader")
 
         with TabbedContent(id="tabs"):
             with TabPane("1: DECK", id="tab-np"):
                 with Horizontal(id="np-top"):
-                    yield Static(idle_artwork(), id="np-thumb")
+                    yield Static(idle_artwork(), id="np-thumb", markup=False)
                     with Vertical(id="np-meta-box"):
-                        yield Static("Nothing Playing", id="np-title")
-                        yield Static("Author: --", id="np-author")
-                        yield Static("IDLE  |  Queue: 0 / 0  |  Vol: 100%", id="np-tech")
-                        yield Static("▁" * 44, id="np-eq")
+                        yield Static("Nothing Playing", id="np-title", markup=False)
+                        yield Static("Author: --", id="np-author", markup=False)
+                        yield Static("IDLE  |  Queue: 0 / 0  |  Vol: 100%", id="np-tech", markup=False)
+                        yield Static("▁" * 44, id="np-eq", markup=False)
                         yield ProgressBar(total=100, show_eta=False, show_percentage=True, id="np-progress")
-                        yield Static("0:00 / 0:00", id="np-time")
+                        yield Static("0:00 / 0:00", id="np-time", markup=False)
                         with Horizontal(id="np-controls"):
                             yield Button("PREV", id="ctl-prev")
                             yield Button("PLAY/PAUSE", id="ctl-pause", classes="primary")
@@ -303,7 +304,7 @@ class SawStreamApp(App):
                             yield Button("MINIMAL", id="ctl-minimal", classes="primary")
                             yield Button(self._lbl("auto_save_music", "SAVE"), id="ctl-save-music", classes="on" if self.settings["auto_save_music"] else "")
                 with Horizontal(id="queue-header"):
-                    yield Static("UP NEXT QUEUE (ENTER TO JUMP)", id="queue-label")
+                    yield Static("UP NEXT QUEUE (ENTER TO JUMP)", id="queue-label", markup=False)
                     yield Button("SHUFFLE", id="q-shuffle")
                     yield Button("FAVORITES", id="q-favs")
                     yield Button("FAV", id="ctl-fav")
@@ -393,19 +394,19 @@ class SawStreamApp(App):
 
         # --- MINIMAL VISUALIZER + SPOTIFY-LIKE BAR ---
         with Vertical(id="minimal-view"):
-            yield Static("", id="min-vis")
+            yield Static("", id="min-vis", markup=False)
             yield Input(
                 placeholder="Quick Play: type a song name OR paste YouTube / Spotify / Playlist URL (Esc to close)...",
                 id="min-quick",
             )
             with Horizontal(id="min-bar"):
-                yield Static(mini_idle_artwork(), id="min-thumb")
+                yield Static(mini_idle_artwork(), id="min-thumb", markup=False)
                 with Vertical(id="min-meta"):
-                    yield Static("Nothing Playing", id="min-title")
-                    yield Static("Press [/] to play a song, or [v] to open Full Mode", id="min-author")
+                    yield Static("Nothing Playing", id="min-title", markup=False)
+                    yield Static("Press [/] to play a song, or [v] to open Full Mode", id="min-author", markup=False)
                     yield ProgressBar(total=100, show_eta=False, show_percentage=False, id="min-progress")
-                    yield Static("0:00 / 0:00  ·  IDLE", id="min-info")
-                    yield Static("[v] Full  [b] Style  [/] Play  [Space] Pause  [n/p] Skip  [s] Save  [f] Fav  [-/=] Vol  [q] Quit", id="min-hints")
+                    yield Static("0:00 / 0:00  ·  IDLE", id="min-info", markup=False)
+                    yield Static("[v] Full  [b] Style  [/] Play  [Space] Pause  [n/p] Skip  [s] Save  [f] Fav  [-/=] Vol  [q] Quit", id="min-hints", markup=False)
 
     def on_mount(self) -> None:
         self.query_one("#queue-table", DataTable).add_columns("#", "TRACK TITLE", "AUTHOR", "DURATION")
@@ -418,7 +419,7 @@ class SawStreamApp(App):
         self.query_one("#mirror-table", DataTable).add_columns("SERVICE", "MIRROR ENDPOINT", "STATUS", "LATENCY")
 
         self.set_interval(0.35, self.poll_player)
-        self.set_interval(0.06, self.tick_visualizer)
+        self.set_interval(0.04, self.tick_visualizer)
         self.refresh_offline_table()
         if self.minimal_mode:
             self._apply_minimal_mode(True)
@@ -442,6 +443,7 @@ class SawStreamApp(App):
 
         mv = self.query_one("#minimal-view")
         if enabled:
+            self._vis_idle_drawn = False
             mv.add_class("active")
             self.vis.start()
             self.set_focus(None)
@@ -461,6 +463,7 @@ class SawStreamApp(App):
         idx = (VIS_STYLES.index(self.vis_style) + 1) % len(VIS_STYLES)
         self.vis_style = VIS_STYLES[idx]
         self.settings["vis_style"] = self.vis_style
+        self._vis_idle_drawn = False
         save_settings(self.settings)
         if not self.minimal_mode:
             self.set_status(f"VISUALIZER STYLE: {self.vis_style} (Press 'v' for Minimal Mode)")
@@ -486,13 +489,19 @@ class SawStreamApp(App):
     def tick_visualizer(self) -> None:
         if not self.minimal_mode:
             return
+        frame = self.vis.step(self.is_playing_audio)
+        if frame["quiet"]:
+            if self._vis_idle_drawn:
+                return
+            self._vis_idle_drawn = True
+        else:
+            self._vis_idle_drawn = False
         vis_widget = self.query_one("#min-vis", Static)
         w = max(24, vis_widget.size.width - 2)
         h = max(6, vis_widget.size.height)
-        levels, peaks, live_pcm = self.vis.step_levels(self.is_playing_audio)
-        src = "LIVE PCM" if live_pcm else ("WAVE" if self.is_playing_audio else "IDLE")
+        src = "LIVE PCM" if frame["live"] else ("REACTIVE" if self.is_playing_audio else "IDLE")
         tag = f"SAWSTREAM · {self.vis_style} · {src}"
-        vis_widget.update(render_visualizer(levels, peaks, width=w, height=h, style_name=self.vis_style, header_tag=tag))
+        vis_widget.update(render_visualizer(frame, width=w, height=h, style_name=self.vis_style, header_tag=tag))
 
     @on(TabbedContent.TabActivated)
     def on_tab_activated(self, event: TabbedContent.TabActivated) -> None:
