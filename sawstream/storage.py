@@ -32,6 +32,7 @@ DEFAULT_SETTINGS = {
     "volume": 100,
     "repeat_mode": "OFF",
     "vis_style": "SPEAK",
+    "vis_theme": "CRIMSON",
 }
 
 
