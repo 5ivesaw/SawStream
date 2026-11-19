@@ -24,6 +24,7 @@ from textual.widgets import (
 from sawstream import __version__
 from sawstream.artwork import idle_artwork, render_thumbnail
 from sawstream.engine import HeadlessMPV
+from sawstream.scraper import archive_channel_media, export_channel_scrape, scrape_channel_full
 from sawstream.mirrors import (
     extract_media_in_process,
     fetch_anime_feed,
@@ -125,7 +126,8 @@ class SawStreamApp(App):
         ("4", "switch_tab('tab-anime')", "Anime"),
         ("5", "switch_tab('tab-movies')", "Movies"),
         ("6", "switch_tab('tab-offline')", "Offline"),
-        ("7", "switch_tab('tab-mirrors')", "Mirrors"),
+        ("7", "switch_tab('tab-scraper')", "Scraper"),
+        ("8", "switch_tab('tab-mirrors')", "Mirrors"),
     ]
 
     def __init__(self):
@@ -144,6 +146,9 @@ class SawStreamApp(App):
         self.anime_rows = []
         self.movie_rows = []
         self.offline_rows = []
+        self.scrape_data = None
+        self.scrape_rows = []
+        self.scrape_filter = "PLAYLISTS"
 
     def _lbl(self, key: str, prefix: str) -> str:
         return f"{prefix}: ON" if self.settings.get(key) else f"{prefix}: OFF"
@@ -265,7 +270,19 @@ class SawStreamApp(App):
                     yield Button("DELETE FILE", id="offline-delete")
 
             # --- TAB 7: MIRRORS ---
-            with TabPane("7: MIRRORS", id="tab-mirrors"):
+            with TabPane("7: SCRAPER", id="tab-scraper"):
+                with Horizontal(classes="toolbar"):
+                    yield Input(placeholder="Paste @handle or Channel URL to scrape all public playlists & videos...", id="scrape-input")
+                    yield Button("SCAN", id="scrape-scan", classes="primary")
+                    yield Button("PLAYLISTS", id="sf-playlists")
+                    yield Button("ALL", id="sf-all")
+                yield DataTable(id="scrape-table", cursor_type="row")
+                with Horizontal(classes="actions"):
+                    yield Button("QUEUE ALL", id="scrape-queue", classes="primary")
+                    yield Button("EXPORT JSON/CSV", id="scrape-export")
+                    yield Button("ARCHIVE MP3", id="scrape-mp3")
+                    yield Button("ARCHIVE MKV", id="scrape-mkv")
+            with TabPane("8: MIRRORS", id="tab-mirrors"):
                 with Horizontal(classes="toolbar"):
                     yield Button("PING ALL MIRRORS (CONCURRENT)", id="mirror-check", classes="primary")
                 yield DataTable(id="mirror-table", cursor_type="row")
@@ -279,6 +296,7 @@ class SawStreamApp(App):
         self.query_one("#anime-table", DataTable).add_columns("ANIME TITLE", "EPS", "SCORE", "STATUS")
         self.query_one("#movie-table", DataTable).add_columns("TITLE", "YEAR", "RATING", "GENRE")
         self.query_one("#offline-table", DataTable).add_columns("TYPE", "TITLE", "SIZE")
+        self.query_one("#scrape-table", DataTable).add_columns("SECTION", "PLAYLIST", "TITLE", "DURATION")
         self.query_one("#mirror-table", DataTable).add_columns("SERVICE", "MIRROR ENDPOINT", "STATUS", "LATENCY")
 
         self.set_interval(0.35, self.poll_player)
@@ -700,6 +718,32 @@ class SawStreamApp(App):
         except Exception as e:
             self.call_from_thread(self.set_status, f"DOWNLOAD FAILED: {e}", False)
 
+    def refresh_scrape(self):
+        t = self.query_one("#scrape-table", DataTable); t.clear()
+        if not self.scrape_data: return
+        f = self.scrape_filter
+        self.scrape_rows = [x for x in self.scrape_data["items"] if f == "ALL" or x["section"] == f]
+        for x in self.scrape_rows: t.add_row(x["section"], (x["playlist"] or "-")[:22], x["title"][:48], fmt_dur(x["duration"]))
+
+    @work(thread=True)
+    def run_scrape(self, raw: str):
+        self.call_from_thread(self.set_status, f"SCRAPING {raw}...", True)
+        try:
+            d = scrape_channel_full(raw, progress_cb=lambda m: self.call_from_thread(self.set_status, m, True))
+            self.scrape_data = d
+            self.scrape_filter = "PLAYLISTS" if d["playlists"] else "ALL"
+            self.call_from_thread(self.refresh_scrape)
+            self.call_from_thread(self.set_status, f"SCRAPED {d['channel_name']}: {d['playlist_count']} PLAYLISTS, {d['unique_video_count']} VIDEOS", False)
+        except Exception as e:
+            self.call_from_thread(self.set_status, f"SCRAPE ERROR: {e}", False)
+
+    @work(thread=True)
+    def run_archive(self, audio: bool):
+        if not self.scrape_data: return
+        dest, done, _ = archive_channel_media(self.scrape_data, audio_only=audio, progress_cb=lambda m: self.call_from_thread(self.set_status, m, True))
+        self.call_from_thread(self.refresh_offline_table)
+        self.call_from_thread(self.set_status, f"ARCHIVED {done} FILES -> {dest}", False)
+
     # --- EVENT HANDLERS ---
     @on(Input.Submitted, "#yt-input")
     def on_yt_submit(self, event: Input.Submitted):
@@ -718,6 +762,10 @@ class SawStreamApp(App):
     @on(Input.Submitted, "#movie-input")
     def on_movie_submit(self, event: Input.Submitted):
         self.load_movies(event.value.strip())
+
+    @on(Input.Submitted, "#scrape-input")
+    def on_scrape_sub(self, e: Input.Submitted):
+        if e.value.strip(): self.run_scrape(e.value.strip())
 
     @on(Input.Changed, "#offline-filter")
     def on_offline_filter(self, event: Input.Changed):
@@ -828,6 +876,17 @@ class SawStreamApp(App):
                     self.set_status(f"DELETED: {item['title'][:50]}")
                 except OSError as e:
                     self.set_status(f"DELETE ERROR: {e}")
+        elif bid == "scrape-scan":
+            v = self.query_one("#scrape-input", Input).value.strip()
+            if v: self.run_scrape(v)
+        elif bid in ("sf-playlists", "sf-all"):
+            self.scrape_filter = "PLAYLISTS" if bid == "sf-playlists" else "ALL"; self.refresh_scrape()
+        elif bid == "scrape-queue" and self.scrape_rows:
+            self.queue = [dict(x) for x in self.scrape_rows]; self.action_switch_tab("tab-np"); self.play_queue_index(0)
+        elif bid == "scrape-export" and self.scrape_data:
+            self.set_status(f"EXPORTED -> {export_channel_scrape(self.scrape_data)}")
+        elif bid == "scrape-mp3": self.run_archive(True)
+        elif bid == "scrape-mkv": self.run_archive(False)
         elif bid == "mirror-check":
             self.check_mirrors()
 
@@ -855,6 +914,8 @@ class SawStreamApp(App):
             self.launch_movie(self.movie_rows[idx][4])
         elif tid == "offline-table" and idx < len(self.offline_rows):
             self._play_offline_item(self.offline_rows[idx])
+        elif tid == "scrape-table" and idx < len(self.scrape_rows):
+            self.queue = [dict(self.scrape_rows[idx])]; self.action_switch_tab("tab-np"); self.play_queue_index(0)
 
 
 def main() -> None:
