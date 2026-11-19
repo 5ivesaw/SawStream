@@ -30,7 +30,7 @@ DEFAULT_SETTINGS = {
     "auto_save_anime": False,
     "auto_save_movies": False,
     "volume": 100,
-    "repeat_mode": "OFF",  # OFF | ALL | ONE
+    "repeat_mode": "OFF",
 }
 
 
@@ -77,6 +77,18 @@ def extract_vid_id(url: str) -> str:
     return m.group(1) if m else ""
 
 
+def is_url(text: str) -> bool:
+    s = (text or "").strip().lower()
+    return s.startswith(("http://", "https://", "www.", "youtube.com/", "youtu.be/", "music.youtube.com/", "open.spotify.com/"))
+
+
+def normalize_url(text: str) -> str:
+    s = (text or "").strip()
+    if s and not s.startswith(("http://", "https://")):
+        return "https://" + s
+    return s
+
+
 def fmt_dur(sec) -> str:
     try:
         s = int(float(sec))
@@ -97,28 +109,34 @@ def fmt_size(num_bytes: int) -> str:
     return f"{num_bytes:.1f} TB"
 
 
-def find_offline_file(directory: Path, vid_id: str = "", title: str = "") -> str | None:
-    """Checks for a valid (>40KB) offline media file by YouTube ID or sanitized title."""
+def find_offline_file(directory: Path, vid_id: str = "", exact_title: str = "") -> str | None:
+    """
+    Strictly matches offline files so random local files are NEVER accidentally played:
+    - For YouTube/Music: matches ONLY exact `[11-char-ID]` tag in filename.
+    - For Anime/Movies (no vid_id): matches ONLY exact sanitized filename stem.
+    """
     if not directory.exists():
         return None
     if vid_id:
-        for path_str in glob.glob(str(directory / f"*[{vid_id}]*")):
-            p = Path(path_str)
-            if p.suffix.lower() in ALL_MEDIA_EXTS and p.is_file() and p.stat().st_size > 40_000:
-                return str(p)
-    if title:
-        safe = sanitize_filename(title).lower()
-        key = safe[:28]
-        if len(key) >= 4:
+        needle = f"[{vid_id}]"
+        for p in directory.iterdir():
+            if p.is_file() and p.suffix.lower() in ALL_MEDIA_EXTS and needle in p.name:
+                if p.stat().st_size > 40_000:
+                    return str(p)
+        return None
+
+    if exact_title:
+        target = sanitize_filename(exact_title).lower()
+        if len(target) >= 4:
             for p in directory.iterdir():
                 if p.is_file() and p.suffix.lower() in ALL_MEDIA_EXTS:
-                    if key in p.name.lower() and p.stat().st_size > 40_000:
+                    stem = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]$", "", p.stem).strip().lower()
+                    if stem == target and p.stat().st_size > 40_000:
                         return str(p)
     return None
 
 
 def make_partial_record_path(title: str, vid_id: str = "") -> tuple[str, str]:
-    """Returns (partial_path, final_music_path) so aborted skips never corrupt ~/Music."""
     ensure_dirs()
     safe = sanitize_filename(title)
     tag = f" [{vid_id}]" if vid_id else ""
@@ -127,7 +145,6 @@ def make_partial_record_path(title: str, vid_id: str = "") -> tuple[str, str]:
 
 
 def commit_partial_recording(partial_path: str, final_path: str, completed: bool) -> bool:
-    """Moves partial recording into ~/Music ONLY if completed; otherwise cleans it up."""
     if not partial_path or not os.path.exists(partial_path):
         return False
     try:
@@ -153,7 +170,6 @@ def cleanup_stale_partials() -> None:
 
 
 def scan_offline_library() -> list[dict]:
-    """Scans Music, Downloads, Anime, and Movies directories for offline media."""
     ensure_dirs()
     sources = [
         ("MUSIC", MUSIC_DIR, AUDIO_EXTS),

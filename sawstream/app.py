@@ -2,10 +2,11 @@ import os
 import random
 import re
 import subprocess
+import sys
+import threading
 from pathlib import Path
 
 import yt_dlp
-from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -24,7 +25,6 @@ from textual.widgets import (
 from sawstream import __version__
 from sawstream.artwork import idle_artwork, render_thumbnail
 from sawstream.engine import HeadlessMPV
-from sawstream.scraper import archive_channel_media, export_channel_scrape, scrape_channel_full
 from sawstream.mirrors import (
     extract_media_in_process,
     fetch_anime_feed,
@@ -32,6 +32,11 @@ from sawstream.mirrors import (
     fetch_yt_feed,
     ping_all_mirrors,
     resolve_audio_stream,
+)
+from sawstream.scraper import (
+    archive_channel_media,
+    export_channel_scrape,
+    scrape_channel_full,
 )
 from sawstream.storage import (
     ANIME_DIR,
@@ -43,9 +48,11 @@ from sawstream.storage import (
     extract_vid_id,
     find_offline_file,
     fmt_dur,
+    is_url,
     load_favorites,
     load_settings,
     make_partial_record_path,
+    normalize_url,
     record_history,
     sanitize_filename,
     save_settings,
@@ -63,6 +70,11 @@ BANNER = r"""
 """
 
 EQ_BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def venv_ytdlp_path() -> str:
+    cand = Path(sys.executable).parent / "yt-dlp"
+    return str(cand) if cand.exists() else "yt-dlp"
 
 
 class SawStreamApp(App):
@@ -141,14 +153,19 @@ class SawStreamApp(App):
         self.is_loading_track = False
         self.current_source_tag = "IDLE"
         self.last_progress_ratio = 0.0
+        self._busy_count = 0
+        self._loaded_tabs: set[str] = set()
+
         self.yt_rows = []
         self.music_rows = []
         self.anime_rows = []
         self.movie_rows = []
         self.offline_rows = []
-        self.scrape_data = None
-        self.scrape_rows = []
-        self.scrape_filter = "PLAYLISTS"
+
+        self.scrape_data: dict | None = None
+        self.scrape_rows: list[dict] = []
+        self.scrape_filter = "ALL"
+        self.scrape_cancel = threading.Event()
 
     def _lbl(self, key: str, prefix: str) -> str:
         return f"{prefix}: ON" if self.settings.get(key) else f"{prefix}: OFF"
@@ -156,16 +173,27 @@ class SawStreamApp(App):
     def _rep_lbl(self) -> str:
         return f"REP: {self.settings.get('repeat_mode', 'OFF')}"
 
+    def _begin_work(self, msg: str) -> None:
+        self._busy_count += 1
+        self.query_one("#status-bar", Static).update(msg)
+        self.query_one("#loader", LoadingIndicator).add_class("active")
+
+    def _end_work(self, msg: str = "") -> None:
+        self._busy_count = max(0, self._busy_count - 1)
+        if msg:
+            self.query_one("#status-bar", Static).update(msg)
+        if self._busy_count == 0:
+            self.query_one("#loader", LoadingIndicator).remove_class("active")
+
+    def set_status(self, text: str) -> None:
+        self.query_one("#status-bar", Static).update(text)
+
     def compose(self) -> ComposeResult:
         yield Static(BANNER, id="banner")
-        yield Static(
-            f"SAWSTREAM v{__version__} BY 5SAW  |  OFFLINE-FIRST + ATOMIC AUTO-SAVE  |  KEYS 1-7 TABS  |  SPACE PAUSE",
-            id="status-bar",
-        )
+        yield Static(f"SAWSTREAM v{__version__} BY 5SAW  |  KEYS 1-8 TABS  |  SPACE PAUSE", id="status-bar")
         yield LoadingIndicator(id="loader")
 
         with TabbedContent(id="tabs"):
-            # --- TAB 1: NOW PLAYING DECK ---
             with TabPane("1: DECK", id="tab-np"):
                 with Horizontal(id="np-top"):
                     yield Static(idle_artwork(), id="np-thumb")
@@ -184,11 +212,7 @@ class SawStreamApp(App):
                             yield Button("+10s", id="ctl-fwd")
                             yield Button(self._rep_lbl(), id="ctl-repeat")
                             yield Button("FAV", id="ctl-fav")
-                            yield Button(
-                                self._lbl("auto_save_music", "SAVE"),
-                                id="ctl-save-music",
-                                classes="on" if self.settings["auto_save_music"] else "",
-                            )
+                            yield Button(self._lbl("auto_save_music", "SAVE"), id="ctl-save-music", classes="on" if self.settings["auto_save_music"] else "")
                 with Horizontal(id="queue-header"):
                     yield Static("UP NEXT QUEUE (ENTER TO JUMP)", id="queue-label")
                     yield Button("SHUFFLE", id="q-shuffle")
@@ -197,28 +221,22 @@ class SawStreamApp(App):
                     yield Button("CLEAR", id="q-clear")
                 yield DataTable(id="queue-table", cursor_type="row")
 
-            # --- TAB 2: YOUTUBE ---
             with TabPane("2: YOUTUBE", id="tab-yt"):
                 with Horizontal(classes="toolbar"):
-                    yield Input(placeholder="Search YouTube or paste any YouTube / Playlist / Spotify URL...", id="yt-input")
-                    yield Button("GO", id="yt-search", classes="primary")
+                    yield Input(placeholder="Search YouTube OR paste any Video / Playlist URL...", id="yt-input")
+                    yield Button("SEARCH / LOAD", id="yt-search", classes="primary")
                     yield Button("HOME", id="yt-home")
                 yield DataTable(id="yt-table", cursor_type="row")
                 with Horizontal(classes="actions"):
-                    yield Button("PLAY AUDIO IN DECK", id="yt-play-audio", classes="primary")
-                    yield Button("WATCH VIDEO", id="yt-play-win")
-                    yield Button(
-                        self._lbl("auto_save_video", "SAVE VID"),
-                        id="ctl-save-video",
-                        classes="on" if self.settings["auto_save_video"] else "",
-                    )
+                    yield Button("WATCH VIDEO", id="yt-play-win", classes="primary")
+                    yield Button("PLAY AUDIO IN DECK", id="yt-play-audio")
+                    yield Button(self._lbl("auto_save_video", "SAVE VID"), id="ctl-save-video", classes="on" if self.settings["auto_save_video"] else "")
                     yield Button("DOWNLOAD MP4", id="yt-dl")
 
-            # --- TAB 3: MUSIC ---
             with TabPane("3: MUSIC", id="tab-music"):
                 with Horizontal(classes="toolbar"):
-                    yield Input(placeholder="Search song/artist OR paste YouTube / Spotify track, album, playlist URL...", id="music-input")
-                    yield Button("GO", id="music-search", classes="primary")
+                    yield Input(placeholder="Search song/artist OR paste YouTube / Spotify URL...", id="music-input")
+                    yield Button("SEARCH / PLAY", id="music-search", classes="primary")
                     yield Button("TRENDING", id="music-home")
                 yield DataTable(id="music-table", cursor_type="row")
                 with Horizontal(classes="actions"):
@@ -227,41 +245,30 @@ class SawStreamApp(App):
                     yield Button("PLAY ALL OFFLINE", id="music-offline")
                     yield Button("DOWNLOAD MP3", id="music-dl")
 
-            # --- TAB 4: ANIME ---
             with TabPane("4: ANIME", id="tab-anime"):
                 with Horizontal(classes="toolbar"):
-                    yield Input(placeholder="Search Anime (AniList + Jikan/MAL failover)...", id="anime-input")
+                    yield Input(placeholder="Search Anime (AniList + Jikan/MAL)...", id="anime-input")
                     yield Button("SEARCH", id="anime-search", classes="primary")
                     yield Button("TRENDING", id="anime-home")
                 yield DataTable(id="anime-table", cursor_type="row")
                 with Horizontal(classes="actions"):
                     yield Button("WATCH SUB", id="anime-sub", classes="primary")
                     yield Button("WATCH DUB", id="anime-dub")
-                    yield Button(
-                        self._lbl("auto_save_anime", "SAVE ANIME"),
-                        id="ctl-save-anime",
-                        classes="on" if self.settings["auto_save_anime"] else "",
-                    )
+                    yield Button(self._lbl("auto_save_anime", "SAVE ANIME"), id="ctl-save-anime", classes="on" if self.settings["auto_save_anime"] else "")
 
-            # --- TAB 5: MOVIES / TV ---
             with TabPane("5: MOVIES", id="tab-movies"):
                 with Horizontal(classes="toolbar"):
-                    yield Input(placeholder="Search Movies or TV Series (YTS + TVMaze failover)...", id="movie-input")
+                    yield Input(placeholder="Search Movies or TV Series (YTS + TVMaze)...", id="movie-input")
                     yield Button("SEARCH", id="movie-search", classes="primary")
                     yield Button("TRENDING", id="movie-home")
                 yield DataTable(id="movie-table", cursor_type="row")
                 with Horizontal(classes="actions"):
                     yield Button("STREAM MOVIE/TV", id="movie-stream", classes="primary")
-                    yield Button(
-                        self._lbl("auto_save_movies", "SAVE MOVIE"),
-                        id="ctl-save-movies",
-                        classes="on" if self.settings["auto_save_movies"] else "",
-                    )
+                    yield Button(self._lbl("auto_save_movies", "SAVE MOVIE"), id="ctl-save-movies", classes="on" if self.settings["auto_save_movies"] else "")
 
-            # --- TAB 6: OFFLINE VAULT ---
             with TabPane("6: OFFLINE", id="tab-offline"):
                 with Horizontal(classes="toolbar"):
-                    yield Input(placeholder="Filter local offline library (Music, Downloads, Anime, Movies)...", id="offline-filter")
+                    yield Input(placeholder="Filter local offline library...", id="offline-filter")
                     yield Button("RESCAN", id="offline-rescan", classes="primary")
                     yield Button("PLAY ALL MUSIC", id="offline-play-all")
                 yield DataTable(id="offline-table", cursor_type="row")
@@ -269,22 +276,27 @@ class SawStreamApp(App):
                     yield Button("PLAY SELECTED", id="offline-play", classes="primary")
                     yield Button("DELETE FILE", id="offline-delete")
 
-            # --- TAB 7: MIRRORS ---
             with TabPane("7: SCRAPER", id="tab-scraper"):
                 with Horizontal(classes="toolbar"):
-                    yield Input(placeholder="Paste @handle or Channel URL to scrape all public playlists & videos...", id="scrape-input")
-                    yield Button("SCAN", id="scrape-scan", classes="primary")
-                    yield Button("PLAYLISTS", id="sf-playlists")
-                    yield Button("ALL", id="sf-all")
-                yield DataTable(id="scrape-table", cursor_type="row")
+                    yield Input(placeholder="Paste @handle, Channel URL, or Playlist URL...", id="scrape-input")
+                    yield Button("PUBLIC PLAYLISTS", id="scrape-pl", classes="primary")
+                    yield Button("FULL CHANNEL", id="scrape-full")
+                    yield Button("STOP", id="scrape-stop")
                 with Horizontal(classes="actions"):
+                    yield Button("ALL", id="sf-all")
+                    yield Button("PLAYLISTS", id="sf-playlists")
+                    yield Button("VIDEOS", id="sf-videos")
+                    yield Button("SHORTS", id="sf-shorts")
                     yield Button("QUEUE ALL", id="scrape-queue", classes="primary")
-                    yield Button("EXPORT JSON/CSV", id="scrape-export")
-                    yield Button("ARCHIVE MP3", id="scrape-mp3")
-                    yield Button("ARCHIVE MKV", id="scrape-mkv")
+                    yield Button("WATCH", id="scrape-watch")
+                    yield Button("EXPORT", id="scrape-export")
+                    yield Button("MP3", id="scrape-mp3")
+                    yield Button("MKV", id="scrape-mkv")
+                yield DataTable(id="scrape-table", cursor_type="row")
+
             with TabPane("8: MIRRORS", id="tab-mirrors"):
                 with Horizontal(classes="toolbar"):
-                    yield Button("PING ALL MIRRORS (CONCURRENT)", id="mirror-check", classes="primary")
+                    yield Button("PING ALL MIRRORS", id="mirror-check", classes="primary")
                 yield DataTable(id="mirror-table", cursor_type="row")
 
         yield Footer()
@@ -301,30 +313,34 @@ class SawStreamApp(App):
 
         self.set_interval(0.35, self.poll_player)
         self.refresh_offline_table()
-        self.load_yt("")
-        self.load_music("")
-        self.load_anime("")
-        self.load_movies("")
 
     def on_unmount(self) -> None:
+        self.scrape_cancel.set()
         self.mpv.shutdown()
 
-    def set_status(self, text: str, loading: bool | None = None) -> None:
-        self.query_one("#status-bar", Static).update(text)
-        if loading is not None:
-            loader = self.query_one("#loader", LoadingIndicator)
-            loader.add_class("active") if loading else loader.remove_class("active")
+    @on(TabbedContent.TabActivated)
+    def on_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        tid = event.pane.id
+        if tid in self._loaded_tabs:
+            return
+        if tid == "tab-yt" and not self.yt_rows:
+            self._loaded_tabs.add(tid)
+            self.load_yt("")
+        elif tid == "tab-music" and not self.music_rows:
+            self._loaded_tabs.add(tid)
+            self.load_music("")
+        elif tid == "tab-anime" and not self.anime_rows:
+            self._loaded_tabs.add(tid)
+            self.load_anime("")
+        elif tid == "tab-movies" and not self.movie_rows:
+            self._loaded_tabs.add(tid)
+            self.load_movies("")
 
     def refresh_queue_table(self) -> None:
         t = self.query_one("#queue-table", DataTable)
         t.clear()
         for i, item in enumerate(self.queue):
-            t.add_row(
-                f"> {i + 1}" if i == self.queue_idx else f"  {i + 1}",
-                item["title"][:56],
-                item["author"][:24],
-                fmt_dur(item.get("duration", 0)),
-            )
+            t.add_row(f"> {i + 1}" if i == self.queue_idx else f"  {i + 1}", item["title"][:56], item["author"][:24], fmt_dur(item.get("duration", 0)))
 
     def refresh_offline_table(self, needle: str = "") -> None:
         all_items = scan_offline_library()
@@ -335,13 +351,22 @@ class SawStreamApp(App):
         for it in self.offline_rows:
             t.add_row(it["kind"], it["title"][:64], it["size"])
 
-    # --- LIVE IPC POLLER + EQUALIZER + ATOMIC COMPLETION ---
+    def refresh_scrape_table(self) -> None:
+        t = self.query_one("#scrape-table", DataTable)
+        t.clear()
+        if not self.scrape_data:
+            self.scrape_rows = []
+            return
+        f = self.scrape_filter
+        self.scrape_rows = [x for x in self.scrape_data.get("items", []) if f == "ALL" or x.get("section") == f]
+        for x in self.scrape_rows:
+            t.add_row(x["section"], (x["playlist"] or "-")[:22], x["title"][:48], fmt_dur(x["duration"]))
+
     def poll_player(self) -> None:
         if self.queue_idx < 0 or self.is_loading_track:
             return
         st = self.mpv.snapshot_state()
         if st.get("idle") is True:
-            # Track finished naturally -> commit recording if >= 85% played
             completed = self.last_progress_ratio >= 0.85
             if self.mpv.finalize_recording(completed=completed):
                 self.refresh_offline_table()
@@ -380,139 +405,368 @@ class SawStreamApp(App):
             tech_parts.append(f"Buf {cache}s")
         self.query_one("#np-tech", Static).update("  |  ".join(tech_parts))
         self.query_one("#np-time", Static).update(f"{fmt_dur(pos)} / {fmt_dur(dur)}")
-
         if dur > 0:
             self.query_one("#np-progress", ProgressBar).update(total=dur, progress=min(pos, dur))
+        self.query_one("#np-eq", Static).update("▁" * 44 if (paused or muted) else "".join(EQ_BLOCKS[random.randint(1, len(EQ_BLOCKS) - 1)] for _ in range(44)))
 
-        # Smooth reactive equalizer strip
-        if paused or muted:
-            self.query_one("#np-eq", Static).update("▁" * 44)
-        else:
-            bars = "".join(EQ_BLOCKS[random.randint(1, len(EQ_BLOCKS) - 1)] for _ in range(44))
-            self.query_one("#np-eq", Static).update(bars)
+    # --- YOUTUBE / MUSIC / URL WORKERS (ALL WITH TRY/FINALLY SO LOADER NEVER STALLS) ---
+    @work(thread=True, group="yt", exclusive=True)
+    def load_yt(self, query: str):
+        self.call_from_thread(self._begin_work, f"LOADING YOUTUBE: {query or 'HOME'}...")
+        msg = "YOUTUBE READY"
+        try:
+            if is_url(query):
+                tracks = extract_media_in_process(query)
+                rows = [(tr["title"][:60], tr["author"][:24], fmt_dur(tr["duration"]), tr["webpage_url"]) for tr in tracks]
+                src = "DIRECT URL"
+            else:
+                rows, src = fetch_yt_feed(query, music_only=False)
+            self.yt_rows = rows
+            def update():
+                t = self.query_one("#yt-table", DataTable)
+                t.clear()
+                for r in rows:
+                    t.add_row(r[0], r[1], r[2])
+            self.call_from_thread(update)
+            msg = f"YOUTUBE: {len(rows)} RESULTS ({src})" if rows else f"YOUTUBE: NO RESULTS ({src})"
+        except Exception as e:
+            msg = f"YOUTUBE ERROR: {e}"
+        finally:
+            self.call_from_thread(self._end_work, msg)
 
-    # --- IN-PROCESS MEDIA PIPELINE ---
-    @work(thread=True)
+    @work(thread=True, group="music", exclusive=True)
+    def load_music(self, query: str):
+        self.call_from_thread(self._begin_work, f"SEARCHING MUSIC: {query or 'TRENDING'}...")
+        msg = "MUSIC READY"
+        try:
+            rows, src = fetch_yt_feed(query, music_only=True)
+            self.music_rows = rows
+            def update():
+                t = self.query_one("#music-table", DataTable)
+                t.clear()
+                for r in rows:
+                    t.add_row(r[0], r[1], r[2])
+            self.call_from_thread(update)
+            msg = f"MUSIC: {len(rows)} TRACKS ({src})" if rows else f"MUSIC: NO RESULTS ({src})"
+        except Exception as e:
+            msg = f"MUSIC ERROR: {e}"
+        finally:
+            self.call_from_thread(self._end_work, msg)
+
+    @work(thread=True, group="anime", exclusive=True)
+    def load_anime(self, query: str):
+        self.call_from_thread(self._begin_work, f"FETCHING ANIME: {query or 'TRENDING'}...")
+        msg = "ANIME READY"
+        try:
+            rows, src = fetch_anime_feed(query)
+            self.anime_rows = rows
+            def update():
+                t = self.query_one("#anime-table", DataTable)
+                t.clear()
+                for r in rows:
+                    t.add_row(r[0], r[1], r[2], r[3])
+            self.call_from_thread(update)
+            msg = f"ANIME: {len(rows)} TITLES ({src})"
+        except Exception as e:
+            msg = f"ANIME ERROR: {e}"
+        finally:
+            self.call_from_thread(self._end_work, msg)
+
+    @work(thread=True, group="movies", exclusive=True)
+    def load_movies(self, query: str):
+        self.call_from_thread(self._begin_work, f"FETCHING MOVIES: {query or 'TRENDING'}...")
+        msg = "MOVIES READY"
+        try:
+            rows, src = fetch_movies_feed(query)
+            self.movie_rows = rows
+            def update():
+                t = self.query_one("#movie-table", DataTable)
+                t.clear()
+                for r in rows:
+                    t.add_row(r[0], r[1], r[2], r[3])
+            self.call_from_thread(update)
+            msg = f"MOVIES: {len(rows)} TITLES ({src})"
+        except Exception as e:
+            msg = f"MOVIES ERROR: {e}"
+        finally:
+            self.call_from_thread(self._end_work, msg)
+
+    @work(thread=True, group="mirrors", exclusive=True)
+    def check_mirrors(self):
+        self.call_from_thread(self._begin_work, "PINGING ALL MIRRORS...")
+        msg = "MIRROR CHECK DONE"
+        try:
+            results = ping_all_mirrors()
+            def update():
+                t = self.query_one("#mirror-table", DataTable)
+                t.clear()
+                for r in results:
+                    t.add_row(*r)
+            self.call_from_thread(update)
+            online = sum(1 for r in results if r[2] == "ONLINE")
+            msg = f"MIRRORS: {online}/{len(results)} ONLINE"
+        except Exception as e:
+            msg = f"MIRROR CHECK ERROR: {e}"
+        finally:
+            self.call_from_thread(self._end_work, msg)
+
+    @work(thread=True, group="load_url", exclusive=True)
     def load_and_play_url(self, url: str, append_only: bool = False):
+        url = normalize_url(url)
         vid_id = extract_vid_id(url)
         if vid_id and "list=" not in url and "open.spotify.com" not in url:
-            local_file = find_offline_file(MUSIC_DIR, vid_id)
+            local_file = find_offline_file(MUSIC_DIR, vid_id=vid_id)
             if local_file:
                 clean = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]$", "", Path(local_file).stem)
                 track = {"id": vid_id, "title": clean, "author": "Offline Library", "duration": 0, "thumbnail": "", "webpage_url": url, "local_path": local_file}
                 if append_only and self.queue:
                     self.queue.append(track)
                     self.call_from_thread(self.refresh_queue_table)
-                    self.call_from_thread(self.set_status, f"QUEUED OFFLINE: {clean}", False)
+                    self.call_from_thread(self.set_status, f"QUEUED OFFLINE: {clean}")
                 else:
                     self.queue = [track]
                     self.call_from_thread(self.action_switch_tab, "tab-np")
                     self.call_from_thread(self.play_queue_index, 0)
                 return
 
-        label = "SPOTIFY TRACKLIST" if "open.spotify.com" in url else "METADATA VIA YT-DLP API"
-        self.call_from_thread(self.set_status, f"EXTRACTING {label}...", True)
+        self.call_from_thread(self._begin_work, "EXTRACTING TRACKS...")
+        msg = ""
         try:
             tracks = extract_media_in_process(url)
+            if not tracks:
+                msg = "NO PLAYABLE TRACKS FOUND AT THAT LINK."
+                return
+            if append_only and self.queue:
+                self.queue.extend(tracks)
+                self.call_from_thread(self.refresh_queue_table)
+                msg = f"QUEUED {len(tracks)} TRACK(S)."
+                return
+            self.queue = tracks
+            self.call_from_thread(self.action_switch_tab, "tab-np")
+            self.call_from_thread(self.play_queue_index, 0)
+            msg = f"LOADED {len(tracks)} TRACK(S)."
         except Exception as e:
-            self.call_from_thread(self.set_status, f"EXTRACTION ERROR: {e}", False)
-            return
+            msg = f"LINK ERROR: {e}"
+        finally:
+            self.call_from_thread(self._end_work, msg)
 
-        if not tracks:
-            self.call_from_thread(self.set_status, "NO PLAYABLE TRACKS FOUND.", False)
-            return
-
-        if append_only and self.queue:
-            self.queue.extend(tracks)
-            self.call_from_thread(self.refresh_queue_table)
-            self.call_from_thread(self.set_status, f"QUEUED {len(tracks)} TRACK(S).", False)
-            return
-
-        self.queue = tracks
-        self.call_from_thread(self.action_switch_tab, "tab-np")
-        self.call_from_thread(self.play_queue_index, 0)
-
-    @work(thread=True)
+    @work(thread=True, group="play_track", exclusive=True)
     def play_queue_index(self, idx: int):
         if idx < 0 or idx >= len(self.queue):
             return
         self.is_loading_track = True
-        prev_completed = self.last_progress_ratio >= 0.85
-        self.last_progress_ratio = 0.0
-        self.queue_idx = idx
-        item = self.queue[idx]
-        vid_id = item.get("id") or extract_vid_id(item.get("webpage_url", ""))
-
-        self.call_from_thread(self.refresh_queue_table)
-        self.call_from_thread(self.query_one("#np-title", Static).update, f"Loading: {item['title'][:65]}...")
-
-        # 1. Offline-First Check
-        local_path = item.get("local_path") or find_offline_file(MUSIC_DIR, vid_id, item.get("title", ""))
-        if local_path and os.path.exists(local_path):
-            self.current_source_tag = "OFFLINE"
-            thumb_render = render_thumbnail(item.get("thumbnail", ""), vid_id=vid_id)
-            if self.mpv.play_source(local_path, prev_completed=prev_completed):
-                self.call_from_thread(self.refresh_offline_table)
-            record_history(item)
-            self.is_loading_track = False
-
-            def update_offline_ui():
-                self.query_one("#np-thumb", Static).update(thumb_render)
-                self.query_one("#np-title", Static).update(item["title"][:72])
-                self.query_one("#np-author", Static).update(f"Author: {item['author']}  ·  {Path(local_path).name[:30]}")
-                self.query_one("#np-progress", ProgressBar).update(total=float(item.get("duration") or 100), progress=0)
-                self.refresh_queue_table()
-                self.set_status(f"[OFFLINE] {item['title'][:58]}", False)
-
-            self.call_from_thread(update_offline_ui)
-            return
-
-        # 2. Online Stream + Atomic Partial Recording
-        self.call_from_thread(self.set_status, f"RESOLVING STREAM: {item['title'][:50]}...", True)
+        self.call_from_thread(self._begin_work, f"LOADING: {self.queue[idx]['title'][:48]}...")
+        msg = ""
         try:
+            prev_completed = self.last_progress_ratio >= 0.85
+            self.last_progress_ratio = 0.0
+            self.queue_idx = idx
+            item = self.queue[idx]
+            vid_id = item.get("id") or extract_vid_id(item.get("webpage_url", ""))
+
+            self.call_from_thread(self.refresh_queue_table)
+            self.call_from_thread(self.query_one("#np-title", Static).update, f"Loading: {item['title'][:65]}...")
+
+            # STRICT offline check: ONLY exact local_path or exact [vid_id] match (NEVER random substring!)
+            local_path = item.get("local_path") or (find_offline_file(MUSIC_DIR, vid_id=vid_id) if vid_id else None)
+            if local_path and os.path.exists(local_path):
+                self.current_source_tag = "OFFLINE"
+                thumb_render = render_thumbnail(item.get("thumbnail", ""), vid_id=vid_id)
+                if self.mpv.play_source(local_path, prev_completed=prev_completed):
+                    self.call_from_thread(self.refresh_offline_table)
+                record_history(item)
+                def update_offline_ui():
+                    self.query_one("#np-thumb", Static).update(thumb_render)
+                    self.query_one("#np-title", Static).update(item["title"][:72])
+                    self.query_one("#np-author", Static).update(f"Author: {item['author']}  ·  {Path(local_path).name[:30]}")
+                    self.query_one("#np-progress", ProgressBar).update(total=float(item.get("duration") or 100), progress=0)
+                    self.refresh_queue_table()
+                self.call_from_thread(update_offline_ui)
+                msg = f"[OFFLINE] {item['title'][:58]}"
+                return
+
             resolved = resolve_audio_stream(item["webpage_url"])
+            if not resolved or not resolved.get("stream_url"):
+                msg = "FAILED TO RESOLVE AUDIO STREAM."
+                return
+
+            self.queue[idx].update(resolved)
+            vid_id = resolved.get("id") or vid_id
+            partial_path = final_path = ""
+            if self.settings.get("auto_save_music"):
+                partial_path, final_path = make_partial_record_path(resolved["title"], vid_id)
+                self.current_source_tag = "STREAM + SAVING"
+            else:
+                self.current_source_tag = "STREAM"
+
+            thumb_render = render_thumbnail(resolved["thumbnail"], vid_id=vid_id)
+            if self.mpv.play_source(resolved["stream_url"], partial_path=partial_path, final_path=final_path, prev_completed=prev_completed):
+                self.call_from_thread(self.refresh_offline_table)
+            record_history(resolved)
+
+            def update_ui():
+                self.query_one("#np-thumb", Static).update(thumb_render)
+                self.query_one("#np-title", Static).update(resolved["title"][:72])
+                self.query_one("#np-author", Static).update(f"Author: {resolved['author']}")
+                self.query_one("#np-progress", ProgressBar).update(total=float(resolved["duration"] or 100), progress=0)
+                self.refresh_queue_table()
+            self.call_from_thread(update_ui)
+            msg = f"PLAYING: {resolved['title'][:50]}{' (Auto-saving)' if partial_path else ''}"
         except Exception as e:
+            msg = f"PLAYBACK ERROR: {e}"
+        finally:
             self.is_loading_track = False
-            self.call_from_thread(self.set_status, f"STREAM ERROR: {e}", False)
+            self.call_from_thread(self._end_work, msg)
+
+    # --- LIVE-STREAMING CHANNEL SCRAPER WORKER ---
+    @work(thread=True, group="scraper", exclusive=True)
+    def run_scrape(self, raw: str, playlists_only: bool = True):
+        self.scrape_cancel.clear()
+        self.scrape_data = None
+        self.scrape_rows = []
+        self.scrape_filter = "ALL"
+
+        def reset_tbl():
+            self.query_one("#scrape-table", DataTable).clear()
+            self._begin_work(f"SCRAPING {'PLAYLISTS' if playlists_only else 'FULL CHANNEL'}: {raw}...")
+
+        self.call_from_thread(reset_tbl)
+        msg = "SCRAPE FINISHED"
+        try:
+            def on_item(rec: dict):
+                self.scrape_rows.append(rec)
+                def add_row():
+                    self.query_one("#scrape-table", DataTable).add_row(
+                        rec["section"],
+                        (rec["playlist"] or "-")[:22],
+                        rec["title"][:48],
+                        fmt_dur(rec["duration"]),
+                    )
+                self.call_from_thread(add_row)
+
+            d = scrape_channel_full(
+                raw,
+                playlists_only=playlists_only,
+                progress_cb=lambda m: self.call_from_thread(self.set_status, m),
+                item_cb=on_item,
+                cancel_event=self.scrape_cancel,
+            )
+            self.scrape_data = d
+            msg = f"SCRAPED {d['channel_name']}: {d['playlist_count']} PLAYLISTS, {d['unique_video_count']} UNIQUE VIDEOS"
+            if d["unique_video_count"] == 0:
+                msg = f"NO PUBLIC ITEMS FOUND FOR '{raw}' (CHECK HANDLE / PLAYLIST PRIVACY)."
+        except Exception as e:
+            msg = f"SCRAPE ERROR: {e}"
+        finally:
+            self.call_from_thread(self._end_work, msg)
+
+    @work(thread=True, group="archive", exclusive=True)
+    def run_archive(self, audio: bool):
+        if not self.scrape_data:
+            self.call_from_thread(self.set_status, "SCAN A CHANNEL FIRST.")
             return
-
-        if not resolved or not resolved.get("stream_url"):
-            self.is_loading_track = False
-            self.call_from_thread(self.set_status, "FAILED TO RESOLVE STREAM.", False)
-            return
-
-        self.queue[idx].update(resolved)
-        vid_id = resolved.get("id") or vid_id
-        partial_path = final_path = ""
-        if self.settings.get("auto_save_music"):
-            partial_path, final_path = make_partial_record_path(resolved["title"], vid_id)
-            self.current_source_tag = "STREAM + SAVING"
-        else:
-            self.current_source_tag = "STREAM"
-
-        thumb_render = render_thumbnail(resolved["thumbnail"], vid_id=vid_id)
-        if self.mpv.play_source(resolved["stream_url"], partial_path=partial_path, final_path=final_path, prev_completed=prev_completed):
+        self.scrape_cancel.clear()
+        self.call_from_thread(self._begin_work, f"ARCHIVING {'MP3' if audio else 'MKV'}...")
+        msg = "ARCHIVE DONE"
+        try:
+            dest, done, failed = archive_channel_media(
+                self.scrape_data,
+                audio_only=audio,
+                progress_cb=lambda m: self.call_from_thread(self.set_status, m),
+                cancel_event=self.scrape_cancel,
+            )
             self.call_from_thread(self.refresh_offline_table)
-        record_history(resolved)
-        self.is_loading_track = False
+            msg = f"ARCHIVED {done} FILES ({failed} ERRORS) -> {dest}"
+        except Exception as e:
+            msg = f"ARCHIVE ERROR: {e}"
+        finally:
+            self.call_from_thread(self._end_work, msg)
 
-        def update_ui():
-            self.query_one("#np-thumb", Static).update(thumb_render)
-            self.query_one("#np-title", Static).update(resolved["title"][:72])
-            self.query_one("#np-author", Static).update(f"Author: {resolved['author']}")
-            self.query_one("#np-progress", ProgressBar).update(total=float(resolved["duration"] or 100), progress=0)
-            self.refresh_queue_table()
-            note = " (Auto-saving to ~/Music on completion)" if partial_path else ""
-            self.set_status(f"PLAYING: {resolved['title'][:48]}{note}", False)
+    @work(thread=True)
+    def download_in_background(self, url: str, audio_only: bool):
+        url = normalize_url(url)
+        self.call_from_thread(self._begin_work, f"DOWNLOADING {'MP3' if audio_only else 'MP4'}...")
+        dest = MUSIC_DIR if audio_only else VIDEO_DIR
+        opts = {"quiet": True, "no_warnings": True, "socket_timeout": 15, "outtmpl": str(dest / "%(title)s [%(id)s].%(ext)s")}
+        if audio_only:
+            opts["format"] = "bestaudio/best"
+            opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}]
+        else:
+            opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+        msg = f"SAVED TO {dest}"
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+            self.call_from_thread(self.refresh_offline_table)
+        except Exception as e:
+            msg = f"DOWNLOAD FAILED: {e}"
+        finally:
+            self.call_from_thread(self._end_work, msg)
 
-        self.call_from_thread(update_ui)
+    # --- VIDEO / ANIME / MOVIE LAUNCHERS (USES VENV YT-DLP + STRICT ID MATCH) ---
+    def spawn_detached_video(self, url: str, title: str = "") -> None:
+        url = normalize_url(url)
+        vid_id = extract_vid_id(url)
+        local_vid = find_offline_file(VIDEO_DIR, vid_id=vid_id) if vid_id else None
+        if local_vid:
+            subprocess.Popen(["mpv", "--no-terminal", "--really-quiet", local_vid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.set_status(f"[OFFLINE VIDEO] {Path(local_vid).name}")
+            return
 
-    # --- ACTIONS & TOGGLES ---
+        cmd = [
+            "mpv",
+            "--no-terminal",
+            "--really-quiet",
+            f"--script-opts=ytdl_hook-ytdl_path={venv_ytdlp_path()}",
+        ]
+        if self.settings.get("auto_save_video") and vid_id:
+            out_path = str(VIDEO_DIR / f"{sanitize_filename(title or vid_id)} [{vid_id}].mkv")
+            cmd.append(f"--stream-record={out_path}")
+            self.set_status(f"WATCHING + SAVING -> ~/Downloads/{Path(out_path).name}")
+        else:
+            self.set_status(f"OPENING VIDEO WINDOW: {(title or url)[:48]}")
+        cmd.append(url)
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def launch_anime(self, title: str, dub: bool = False) -> None:
+        local = find_offline_file(ANIME_DIR, exact_title=title)
+        if local:
+            subprocess.Popen(["mpv", "--no-terminal", "--really-quiet", local], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.set_status(f"[OFFLINE ANIME] {Path(local).name}")
+            return
+        cmd = [os.path.expanduser("~/.local/bin/ani-cli")]
+        if dub:
+            cmd.append("--dub")
+        if self.settings.get("auto_save_anime"):
+            cmd.append("-d")
+        cmd.append(title)
+        with self.suspend():
+            os.system("clear")
+            subprocess.run(cmd, cwd=str(ANIME_DIR))
+        self.refresh_offline_table()
+
+    def launch_movie(self, title: str) -> None:
+        local = find_offline_file(MOVIE_DIR, exact_title=title)
+        if local:
+            subprocess.Popen(["mpv", "--no-terminal", "--really-quiet", local], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.set_status(f"[OFFLINE MOVIE] {Path(local).name}")
+            return
+        cmd = [os.path.expanduser("~/.local/bin/lobster")]
+        if self.settings.get("auto_save_movies"):
+            cmd.append("-d")
+        cmd.append(title)
+        with self.suspend():
+            os.system("clear")
+            subprocess.run(cmd, cwd=str(MOVIE_DIR))
+        self.refresh_offline_table()
+
+    # --- ACTIONS ---
     def action_switch_tab(self, tab_id: str) -> None:
         self.query_one("#tabs", TabbedContent).active = tab_id
 
     def action_toggle_pause(self) -> None:
-        self.mpv.toggle_pause()
+        if not isinstance(self.focused, Input):
+            self.mpv.toggle_pause()
 
     def action_toggle_mute(self) -> None:
         self.mpv.toggle_mute()
@@ -541,12 +795,11 @@ class SawStreamApp(App):
 
     def action_cycle_repeat(self) -> None:
         modes = ["OFF", "ALL", "ONE"]
-        cur = self.settings.get("repeat_mode", "OFF")
-        nxt = modes[(modes.index(cur) + 1) % len(modes)]
+        nxt = modes[(modes.index(self.settings.get("repeat_mode", "OFF")) + 1) % len(modes)]
         self.settings["repeat_mode"] = nxt
         save_settings(self.settings)
         self.query_one("#ctl-repeat", Button).label = self._rep_lbl()
-        self.set_status(f"REPEAT MODE: {nxt}")
+        self.set_status(f"REPEAT: {nxt}")
 
     def action_shuffle_queue(self) -> None:
         if len(self.queue) <= 1:
@@ -562,7 +815,7 @@ class SawStreamApp(App):
     def action_favorite_current(self) -> None:
         if 0 <= self.queue_idx < len(self.queue):
             added = toggle_favorite(self.queue[self.queue_idx])
-            self.set_status(f"{'ADDED TO' if added else 'REMOVED FROM'} FAVORITES: {self.queue[self.queue_idx]['title'][:45]}")
+            self.set_status(f"{'FAVORITED' if added else 'UNFAVORITED'}: {self.queue[self.queue_idx]['title'][:45]}")
 
     def action_toggle_save(self, key: str) -> None:
         self.settings[key] = not self.settings.get(key, False)
@@ -577,7 +830,7 @@ class SawStreamApp(App):
         btn = self.query_one(bid, Button)
         btn.label = self._lbl(key, prefix)
         btn.add_class("on") if self.settings[key] else btn.remove_class("on")
-        self.set_status(f"{prefix}: {'ENABLED -> ' + folder if self.settings[key] else 'DISABLED'}")
+        self.set_status(f"{prefix}: {'ON -> ' + folder if self.settings[key] else 'OFF'}")
 
     def load_offline_music(self) -> None:
         tracks = [it for it in scan_offline_library() if it["kind"] == "MUSIC"]
@@ -588,172 +841,38 @@ class SawStreamApp(App):
         self.action_switch_tab("tab-np")
         self.play_queue_index(0)
 
-    def spawn_detached_video(self, url: str, title: str = "") -> None:
-        vid_id = extract_vid_id(url)
-        local_vid = find_offline_file(VIDEO_DIR, vid_id, title)
-        if local_vid:
-            subprocess.Popen(["mpv", "--no-terminal", "--really-quiet", local_vid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.set_status(f"[OFFLINE VIDEO] {Path(local_vid).name}")
-            return
-        cmd = ["mpv", "--no-terminal", "--really-quiet"]
-        if self.settings.get("auto_save_video"):
-            tag = f" [{vid_id}]" if vid_id else ""
-            out_path = str(VIDEO_DIR / f"{sanitize_filename(title or vid_id or 'video')}{tag}.mkv")
-            cmd.append(f"--stream-record={out_path}")
-            self.set_status(f"VIDEO + SAVING -> ~/Downloads/{Path(out_path).name}")
+    def _get_yt_selected_or_pasted(self) -> tuple[str, str]:
+        """If the user selected a row use it; if they pasted a URL in the box and table doesn't match, use the pasted URL."""
+        pasted = self.query_one("#yt-input", Input).value.strip()
+        t = self.query_one("#yt-table", DataTable)
+        if self.yt_rows and 0 <= t.cursor_row < len(self.yt_rows):
+            title, _, _, url = self.yt_rows[t.cursor_row]
+            # If user pasted a direct URL that isn't loaded into the table yet, prioritize the pasted URL!
+            if is_url(pasted) and extract_vid_id(pasted) and extract_vid_id(pasted) != extract_vid_id(url):
+                return pasted, normalize_url(pasted)
+            return title, url
+        if is_url(pasted):
+            return pasted, normalize_url(pasted)
+        return "", ""
+
+    def _play_offline_item(self, item: dict) -> None:
+        if item["kind"] == "MUSIC":
+            self.queue = [item]
+            self.action_switch_tab("tab-np")
+            self.play_queue_index(0)
         else:
-            self.set_status("LAUNCHED VIDEO WINDOW (SAWSTREAM STILL ACTIVE)")
-        cmd.append(url)
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(["mpv", "--no-terminal", "--really-quiet", item["local_path"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.set_status(f"[OFFLINE {item['kind']}] {item['title'][:50]}")
 
-    def launch_anime(self, title: str, dub: bool = False) -> None:
-        local = find_offline_file(ANIME_DIR, title=title)
-        if local:
-            subprocess.Popen(["mpv", "--no-terminal", "--really-quiet", local], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.set_status(f"[OFFLINE ANIME] {Path(local).name}")
-            return
-        cmd = [os.path.expanduser("~/.local/bin/ani-cli")]
-        if dub:
-            cmd.append("--dub")
-        if self.settings.get("auto_save_anime"):
-            cmd.append("-d")
-        cmd.append(title)
-        with self.suspend():
-            os.system("clear")
-            subprocess.run(cmd, cwd=str(ANIME_DIR))
-        self.refresh_offline_table()
-
-    def launch_movie(self, title: str) -> None:
-        local = find_offline_file(MOVIE_DIR, title=title)
-        if local:
-            subprocess.Popen(["mpv", "--no-terminal", "--really-quiet", local], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.set_status(f"[OFFLINE MOVIE] {Path(local).name}")
-            return
-        cmd = [os.path.expanduser("~/.local/bin/lobster")]
-        if self.settings.get("auto_save_movies"):
-            cmd.append("-d")
-        cmd.append(title)
-        with self.suspend():
-            os.system("clear")
-            subprocess.run(cmd, cwd=str(MOVIE_DIR))
-        self.refresh_offline_table()
-
-    # --- BACKGROUND FEED WORKERS ---
-    @work(thread=True)
-    def load_yt(self, query: str):
-        self.call_from_thread(self.set_status, f"FETCHING YOUTUBE: {query or 'TRENDING'}...", True)
-        rows, src = fetch_yt_feed(query, music_only=False)
-        self.yt_rows = rows
-        def update():
-            t = self.query_one("#yt-table", DataTable)
-            t.clear()
-            for r in rows:
-                t.add_row(r[0], r[1], r[2])
-            self.set_status(f"YOUTUBE READY  |  SOURCE: {src}", False)
-        self.call_from_thread(update)
-
-    @work(thread=True)
-    def load_music(self, query: str):
-        self.call_from_thread(self.set_status, f"FETCHING MUSIC: {query or 'TRENDING'}...", True)
-        rows, src = fetch_yt_feed(query, music_only=True)
-        self.music_rows = rows
-        def update():
-            t = self.query_one("#music-table", DataTable)
-            t.clear()
-            for r in rows:
-                t.add_row(r[0], r[1], r[2])
-            self.set_status(f"MUSIC READY  |  SOURCE: {src}", False)
-        self.call_from_thread(update)
-
-    @work(thread=True)
-    def load_anime(self, query: str):
-        rows, _ = fetch_anime_feed(query)
-        self.anime_rows = rows
-        def update():
-            t = self.query_one("#anime-table", DataTable)
-            t.clear()
-            for r in rows:
-                t.add_row(r[0], r[1], r[2], r[3])
-        self.call_from_thread(update)
-
-    @work(thread=True)
-    def load_movies(self, query: str):
-        rows, _ = fetch_movies_feed(query)
-        self.movie_rows = rows
-        def update():
-            t = self.query_one("#movie-table", DataTable)
-            t.clear()
-            for r in rows:
-                t.add_row(r[0], r[1], r[2], r[3])
-        self.call_from_thread(update)
-
-    @work(thread=True)
-    def check_mirrors(self):
-        self.call_from_thread(self.set_status, "PINGING ALL MIRRORS CONCURRENTLY...", True)
-        results = ping_all_mirrors()
-        def update():
-            t = self.query_one("#mirror-table", DataTable)
-            t.clear()
-            for r in results:
-                t.add_row(*r)
-            online = sum(1 for r in results if r[2] == "ONLINE")
-            self.set_status(f"MIRROR CHECK COMPLETE  |  {online}/{len(results)} ONLINE", False)
-        self.call_from_thread(update)
-
-    @work(thread=True)
-    def download_in_background(self, url: str, audio_only: bool):
-        self.call_from_thread(self.set_status, f"DOWNLOADING {'MP3' if audio_only else 'MP4'}...", True)
-        dest = MUSIC_DIR if audio_only else VIDEO_DIR
-        opts = {"quiet": True, "no_warnings": True, "outtmpl": str(dest / "%(title)s [%(id)s].%(ext)s")}
-        if audio_only:
-            opts["format"] = "bestaudio/best"
-            opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}]
-        else:
-            opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([url])
-            self.call_from_thread(self.refresh_offline_table)
-            self.call_from_thread(self.set_status, f"SAVED TO {dest}", False)
-        except Exception as e:
-            self.call_from_thread(self.set_status, f"DOWNLOAD FAILED: {e}", False)
-
-    def refresh_scrape(self):
-        t = self.query_one("#scrape-table", DataTable); t.clear()
-        if not self.scrape_data: return
-        f = self.scrape_filter
-        self.scrape_rows = [x for x in self.scrape_data["items"] if f == "ALL" or x["section"] == f]
-        for x in self.scrape_rows: t.add_row(x["section"], (x["playlist"] or "-")[:22], x["title"][:48], fmt_dur(x["duration"]))
-
-    @work(thread=True)
-    def run_scrape(self, raw: str):
-        self.call_from_thread(self.set_status, f"SCRAPING {raw}...", True)
-        try:
-            d = scrape_channel_full(raw, progress_cb=lambda m: self.call_from_thread(self.set_status, m, True))
-            self.scrape_data = d
-            self.scrape_filter = "PLAYLISTS" if d["playlists"] else "ALL"
-            self.call_from_thread(self.refresh_scrape)
-            self.call_from_thread(self.set_status, f"SCRAPED {d['channel_name']}: {d['playlist_count']} PLAYLISTS, {d['unique_video_count']} VIDEOS", False)
-        except Exception as e:
-            self.call_from_thread(self.set_status, f"SCRAPE ERROR: {e}", False)
-
-    @work(thread=True)
-    def run_archive(self, audio: bool):
-        if not self.scrape_data: return
-        dest, done, _ = archive_channel_media(self.scrape_data, audio_only=audio, progress_cb=lambda m: self.call_from_thread(self.set_status, m, True))
-        self.call_from_thread(self.refresh_offline_table)
-        self.call_from_thread(self.set_status, f"ARCHIVED {done} FILES -> {dest}", False)
-
-    # --- EVENT HANDLERS ---
+    # --- INPUTS ---
     @on(Input.Submitted, "#yt-input")
     def on_yt_submit(self, event: Input.Submitted):
-        val = event.value.strip()
-        self.load_and_play_url(val) if val.startswith(("http://", "https://")) else self.load_yt(val)
+        self.load_yt(event.value.strip())
 
     @on(Input.Submitted, "#music-input")
     def on_music_submit(self, event: Input.Submitted):
         val = event.value.strip()
-        self.load_and_play_url(val) if val.startswith(("http://", "https://")) else self.load_music(val)
+        self.load_and_play_url(val) if is_url(val) else self.load_music(val)
 
     @on(Input.Submitted, "#anime-input")
     def on_anime_submit(self, event: Input.Submitted):
@@ -764,17 +883,20 @@ class SawStreamApp(App):
         self.load_movies(event.value.strip())
 
     @on(Input.Submitted, "#scrape-input")
-    def on_scrape_sub(self, e: Input.Submitted):
-        if e.value.strip(): self.run_scrape(e.value.strip())
+    def on_scrape_submit(self, event: Input.Submitted):
+        val = event.value.strip()
+        if val:
+            self.run_scrape(val, playlists_only=True)
 
     @on(Input.Changed, "#offline-filter")
     def on_offline_filter(self, event: Input.Changed):
         self.refresh_offline_table(event.value)
 
+    # --- BUTTONS ---
     @on(Button.Pressed)
     def on_button(self, event: Button.Pressed):
         bid = event.button.id
-        if bid == "ctl-pause": self.action_toggle_pause()
+        if bid == "ctl-pause": self.mpv.toggle_pause()
         elif bid == "ctl-next": self.action_next_track()
         elif bid == "ctl-prev": self.action_prev_track()
         elif bid == "ctl-back": self.action_seek_back()
@@ -788,21 +910,18 @@ class SawStreamApp(App):
         elif bid == "q-shuffle": self.action_shuffle_queue()
         elif bid == "q-favs":
             favs = load_favorites()
-            if not favs:
-                self.set_status("NO FAVORITES SAVED YET (PRESS 'f' WHILE PLAYING).")
-            else:
+            if favs:
                 self.queue = favs
                 self.play_queue_index(0)
+            else:
+                self.set_status("NO FAVORITES YET (PRESS 'f' WHILE PLAYING).")
         elif bid == "q-del":
             t = self.query_one("#queue-table", DataTable)
             if self.queue and 0 <= t.cursor_row < len(self.queue):
                 idx = t.cursor_row
                 self.queue.pop(idx)
-                if idx < self.queue_idx:
-                    self.queue_idx -= 1
-                elif idx == self.queue_idx:
-                    self.mpv.stop()
-                    self.queue_idx = -1
+                if idx < self.queue_idx: self.queue_idx -= 1
+                elif idx == self.queue_idx: self.mpv.stop(); self.queue_idx = -1
                 self.refresh_queue_table()
         elif bid == "q-clear":
             self.mpv.stop()
@@ -814,33 +933,36 @@ class SawStreamApp(App):
             self.query_one("#np-author", Static).update("Author: --")
             self.query_one("#np-eq", Static).update("▁" * 44)
         elif bid == "yt-search":
-            inp = self.query_one("#yt-input", Input)
-            self.on_yt_submit(Input.Submitted(inp, inp.value))
+            self.load_yt(self.query_one("#yt-input", Input).value.strip())
         elif bid == "yt-home":
             self.query_one("#yt-input", Input).value = ""
             self.load_yt("")
         elif bid in ("yt-play-audio", "yt-play-win", "yt-dl"):
-            t = self.query_one("#yt-table", DataTable)
-            if self.yt_rows and t.cursor_row < len(self.yt_rows):
-                title, _, _, url = self.yt_rows[t.cursor_row]
-                if bid == "yt-play-audio": self.load_and_play_url(url)
-                elif bid == "yt-play-win": self.spawn_detached_video(url, title=title)
-                elif bid == "yt-dl": self.download_in_background(url, audio_only=False)
+            title, url = self._get_yt_selected_or_pasted()
+            if not url:
+                self.set_status("SELECT A VIDEO OR PASTE A URL FIRST.")
+                return
+            if bid == "yt-play-audio": self.load_and_play_url(url)
+            elif bid == "yt-play-win": self.spawn_detached_video(url, title=title)
+            elif bid == "yt-dl": self.download_in_background(url, audio_only=False)
         elif bid == "music-search":
-            inp = self.query_one("#music-input", Input)
-            self.on_music_submit(Input.Submitted(inp, inp.value))
+            val = self.query_one("#music-input", Input).value.strip()
+            self.load_and_play_url(val) if is_url(val) else self.load_music(val)
         elif bid == "music-home":
             self.query_one("#music-input", Input).value = ""
             self.load_music("")
         elif bid in ("music-offline", "offline-play-all"):
             self.load_offline_music()
         elif bid in ("music-play", "music-queue", "music-dl"):
+            pasted = self.query_one("#music-input", Input).value.strip()
             t = self.query_one("#music-table", DataTable)
-            if self.music_rows and t.cursor_row < len(self.music_rows):
-                url = self.music_rows[t.cursor_row][3]
-                if bid == "music-play": self.load_and_play_url(url, append_only=False)
-                elif bid == "music-queue": self.load_and_play_url(url, append_only=True)
-                elif bid == "music-dl": self.download_in_background(url, audio_only=True)
+            url = self.music_rows[t.cursor_row][3] if (self.music_rows and 0 <= t.cursor_row < len(self.music_rows)) else (pasted if is_url(pasted) else "")
+            if not url:
+                self.set_status("SELECT A TRACK OR PASTE A URL FIRST.")
+                return
+            if bid == "music-play": self.load_and_play_url(url, append_only=False)
+            elif bid == "music-queue": self.load_and_play_url(url, append_only=True)
+            elif bid == "music-dl": self.download_in_background(url, audio_only=True)
         elif bid == "anime-search":
             self.load_anime(self.query_one("#anime-input", Input).value.strip())
         elif bid == "anime-home":
@@ -861,7 +983,7 @@ class SawStreamApp(App):
                 self.launch_movie(self.movie_rows[t.cursor_row][4])
         elif bid == "offline-rescan":
             self.refresh_offline_table(self.query_one("#offline-filter", Input).value)
-            self.set_status(f"OFFLINE VAULT SCANNED: {len(self.offline_rows)} FILES")
+            self.set_status(f"OFFLINE VAULT: {len(self.offline_rows)} FILES")
         elif bid == "offline-play":
             t = self.query_one("#offline-table", DataTable)
             if self.offline_rows and t.cursor_row < len(self.offline_rows):
@@ -876,28 +998,34 @@ class SawStreamApp(App):
                     self.set_status(f"DELETED: {item['title'][:50]}")
                 except OSError as e:
                     self.set_status(f"DELETE ERROR: {e}")
-        elif bid == "scrape-scan":
+        elif bid in ("scrape-pl", "scrape-full"):
             v = self.query_one("#scrape-input", Input).value.strip()
-            if v: self.run_scrape(v)
-        elif bid in ("sf-playlists", "sf-all"):
-            self.scrape_filter = "PLAYLISTS" if bid == "sf-playlists" else "ALL"; self.refresh_scrape()
+            if v:
+                self.run_scrape(v, playlists_only=(bid == "scrape-pl"))
+        elif bid == "scrape-stop":
+            self.scrape_cancel.set()
+            self.set_status("STOPPING SCRAPE...")
+        elif bid in ("sf-all", "sf-playlists", "sf-videos", "sf-shorts"):
+            self.scrape_filter = bid.split("-", 1)[1].upper()
+            self.refresh_scrape_table()
+            self.set_status(f"FILTER: {self.scrape_filter} ({len(self.scrape_rows)} ITEMS)")
         elif bid == "scrape-queue" and self.scrape_rows:
-            self.queue = [dict(x) for x in self.scrape_rows]; self.action_switch_tab("tab-np"); self.play_queue_index(0)
-        elif bid == "scrape-export" and self.scrape_data:
-            self.set_status(f"EXPORTED -> {export_channel_scrape(self.scrape_data)}")
-        elif bid == "scrape-mp3": self.run_archive(True)
-        elif bid == "scrape-mkv": self.run_archive(False)
-        elif bid == "mirror-check":
-            self.check_mirrors()
-
-    def _play_offline_item(self, item: dict) -> None:
-        if item["kind"] == "MUSIC":
-            self.queue = [item]
+            self.queue = [dict(x) for x in self.scrape_rows]
             self.action_switch_tab("tab-np")
             self.play_queue_index(0)
-        else:
-            subprocess.Popen(["mpv", "--no-terminal", "--really-quiet", item["local_path"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.set_status(f"[OFFLINE {item['kind']}] {item['title'][:50]}")
+        elif bid == "scrape-watch":
+            t = self.query_one("#scrape-table", DataTable)
+            if self.scrape_rows and 0 <= t.cursor_row < len(self.scrape_rows):
+                r = self.scrape_rows[t.cursor_row]
+                self.spawn_detached_video(r["webpage_url"], title=r["title"])
+        elif bid == "scrape-export" and self.scrape_data:
+            self.set_status(f"EXPORTED -> {export_channel_scrape(self.scrape_data)}")
+        elif bid == "scrape-mp3":
+            self.run_archive(True)
+        elif bid == "scrape-mkv":
+            self.run_archive(False)
+        elif bid == "mirror-check":
+            self.check_mirrors()
 
     @on(DataTable.RowSelected)
     def on_row_selected(self, event: DataTable.RowSelected):
@@ -905,7 +1033,8 @@ class SawStreamApp(App):
         if tid == "queue-table" and idx < len(self.queue):
             self.play_queue_index(idx)
         elif tid == "yt-table" and idx < len(self.yt_rows):
-            self.load_and_play_url(self.yt_rows[idx][3])
+            title, _, _, url = self.yt_rows[idx]
+            self.spawn_detached_video(url, title=title)
         elif tid == "music-table" and idx < len(self.music_rows):
             self.load_and_play_url(self.music_rows[idx][3])
         elif tid == "anime-table" and idx < len(self.anime_rows):
@@ -915,7 +1044,9 @@ class SawStreamApp(App):
         elif tid == "offline-table" and idx < len(self.offline_rows):
             self._play_offline_item(self.offline_rows[idx])
         elif tid == "scrape-table" and idx < len(self.scrape_rows):
-            self.queue = [dict(self.scrape_rows[idx])]; self.action_switch_tab("tab-np"); self.play_queue_index(0)
+            self.queue = [dict(self.scrape_rows[idx])]
+            self.action_switch_tab("tab-np")
+            self.play_queue_index(0)
 
 
 def main() -> None:

@@ -7,34 +7,30 @@ from concurrent.futures import ThreadPoolExecutor
 
 import yt_dlp
 
-from sawstream.storage import extract_vid_id, fmt_dur
+from sawstream.storage import extract_vid_id, fmt_dur, normalize_url
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) SawStream/2.0"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) SawStream/2.2"}
 
 PIPED_MIRRORS = [
     "https://pipedapi.kavin.rocks",
     "https://pipedapi.adminforge.de",
     "https://api.piped.private.coffee",
-    "https://pipedapi.leptons.xyz",
-    "https://pipedapi.darkness.services",
 ]
 
 INVIDIOUS_MIRRORS = [
     "https://inv.nadeko.net",
     "https://invidious.nerdvpn.de",
     "https://yewtu.be",
-    "https://invidious.privacyredirect.com",
 ]
 
 YTS_MIRRORS = [
     "https://yts.mx/api/v2",
     "https://yts.lt/api/v2",
     "https://yts.am/api/v2",
-    "https://yts.ag/api/v2",
 ]
 
 
-def http_json(url: str, data: bytes | None = None, timeout: int = 5):
+def http_json(url: str, data: bytes | None = None, timeout: int = 4):
     req = urllib.request.Request(url, data=data, headers=HEADERS)
     if data is not None:
         req.add_header("Content-Type", "application/json")
@@ -43,8 +39,7 @@ def http_json(url: str, data: bytes | None = None, timeout: int = 5):
 
 
 def parse_spotify_url(url: str) -> list[dict]:
-    """Extracts tracks from any Spotify track/album/playlist URL with ZERO sign-in or API keys."""
-    clean_url = url.split("?")[0]
+    clean_url = normalize_url(url).split("?")[0]
     embed_url = re.sub(
         r"open\.spotify\.com/(?:intl-[a-z]+/)?(track|album|playlist)/",
         r"open.spotify.com/embed/\1/",
@@ -53,7 +48,7 @@ def parse_spotify_url(url: str) -> list[dict]:
     tracks = []
     try:
         req = urllib.request.Request(embed_url, headers=HEADERS)
-        html = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "ignore")
+        html = urllib.request.urlopen(req, timeout=8).read().decode("utf-8", "ignore")
         m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
         if m:
             data = json.loads(m.group(1))
@@ -109,16 +104,20 @@ def parse_spotify_url(url: str) -> list[dict]:
 
 
 def extract_media_in_process(url: str) -> list[dict]:
-    """Extracts a single URL, full YouTube playlist, or Spotify link completely in-process."""
+    """Fast, bounded in-process extraction for single URLs, playlists, and Spotify links."""
+    url = normalize_url(url)
     if "open.spotify.com" in url:
         return parse_spotify_url(url)
 
+    # Cap playlist size at 100 so YouTube infinite Radio Mixes (&list=RD...) never hang forever
     opts = {
         "quiet": True,
         "no_warnings": True,
         "extract_flat": "in_playlist",
         "skip_download": True,
         "ignoreerrors": True,
+        "socket_timeout": 10,
+        "playlistend": 100,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -135,6 +134,8 @@ def extract_media_in_process(url: str) -> list[dict]:
             web_url = e.get("webpage_url") or e.get("url") or (f"https://www.youtube.com/watch?v={vid}" if vid else "")
             if not web_url:
                 continue
+            if not web_url.startswith("http") and vid:
+                web_url = f"https://www.youtube.com/watch?v={vid}"
             out.append({
                 "id": vid,
                 "title": e.get("title") or "Unknown Track",
@@ -157,13 +158,13 @@ def extract_media_in_process(url: str) -> list[dict]:
 
 
 def resolve_audio_stream(webpage_url: str) -> dict | None:
-    """Resolves a direct bestaudio stream URL + full metadata via yt_dlp Python API."""
     opts = {
         "quiet": True,
         "no_warnings": True,
         "format": "bestaudio/best",
         "noplaylist": True,
         "skip_download": True,
+        "socket_timeout": 12,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(webpage_url, download=False)
@@ -186,24 +187,58 @@ def resolve_audio_stream(webpage_url: str) -> dict | None:
 
 
 def fetch_yt_feed(query: str = "", music_only: bool = False):
+    """
+    Uses direct in-process yt-dlp FIRST (fast & reliable, never stalls on dead Piped/Invidious mirrors).
+    Falls back to Piped/Invidious mirrors only if yt-dlp fails.
+    """
+    q = (query or "").strip()
+    search_term = f"{q} song audio" if (q and music_only and "audio" not in q.lower()) else (
+        q if q else ("top music hits 2026" if music_only else "trending videos today")
+    )
+
+    # 1. Primary: Direct yt-dlp search (no dead third-party mirrors!)
+    try:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "skip_download": True,
+            "socket_timeout": 10,
+            "ignoreerrors": True,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            res = ydl.extract_info(f"ytsearch20:{search_term}", download=False)
+        out = []
+        for d in (res.get("entries") or []) if res else []:
+            if not d:
+                continue
+            vid = d.get("id") or extract_vid_id(d.get("url") or "")
+            if not vid:
+                continue
+            out.append((
+                (d.get("title") or "Unknown")[:60],
+                (d.get("channel") or d.get("uploader") or "YouTube")[:24],
+                fmt_dur(d.get("duration", 0)),
+                f"https://www.youtube.com/watch?v={vid}",
+            ))
+        if out:
+            return out, "YT-DLP DIRECT"
+    except Exception:
+        pass
+
+    # 2. Fallback: Piped & Invidious Mirrors (short 3s timeout)
     for base in PIPED_MIRRORS:
         try:
-            if query:
+            if q:
                 filt = "music_songs" if music_only else "videos"
-                items = http_json(f"{base}/search?q={urllib.parse.quote(query)}&filter={filt}").get("items", [])
+                items = http_json(f"{base}/search?q={urllib.parse.quote(q)}&filter={filt}", timeout=3).get("items", [])
             else:
-                items = http_json(f"{base}/trending?region=US")
+                items = http_json(f"{base}/trending?region=US", timeout=3)
             out = []
-            for it in items[:25]:
+            for it in items[:20]:
                 vid = it.get("url", "").split("v=")[-1].split("/")[-1]
-                if not vid or len(vid) < 5:
-                    continue
-                out.append((
-                    it.get("title", "Unknown")[:60],
-                    it.get("uploaderName", "YouTube")[:24],
-                    fmt_dur(it.get("duration", 0)),
-                    f"https://www.youtube.com/watch?v={vid}",
-                ))
+                if vid and len(vid) >= 5:
+                    out.append((it.get("title", "Unknown")[:60], it.get("uploaderName", "YouTube")[:24], fmt_dur(it.get("duration", 0)), f"https://www.youtube.com/watch?v={vid}"))
             if out:
                 return out, f"PIPED ({base.split('//')[1]})"
         except Exception:
@@ -211,46 +246,19 @@ def fetch_yt_feed(query: str = "", music_only: bool = False):
 
     for base in INVIDIOUS_MIRRORS:
         try:
-            if query:
-                url = f"{base}/api/v1/search?q={urllib.parse.quote(query)}&type=video"
-            else:
-                url = f"{base}/api/v1/trending?region=US{'&type=Music' if music_only else ''}"
-            items = http_json(url)
+            url = f"{base}/api/v1/search?q={urllib.parse.quote(q)}&type=video" if q else f"{base}/api/v1/trending?region=US{'&type=Music' if music_only else ''}"
+            items = http_json(url, timeout=3)
             out = []
-            for it in items[:25]:
+            for it in items[:20]:
                 vid = it.get("videoId")
-                if not vid:
-                    continue
-                out.append((
-                    it.get("title", "Unknown")[:60],
-                    it.get("author", "YouTube")[:24],
-                    fmt_dur(it.get("lengthSeconds", 0)),
-                    f"https://www.youtube.com/watch?v={vid}",
-                ))
+                if vid:
+                    out.append((it.get("title", "Unknown")[:60], it.get("author", "YouTube")[:24], fmt_dur(it.get("lengthSeconds", 0)), f"https://www.youtube.com/watch?v={vid}"))
             if out:
                 return out, f"INVIDIOUS ({base.split('//')[1]})"
         except Exception:
             continue
 
-    q = query if query else ("top music hits 2026" if music_only else "trending videos today")
-    try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "extract_flat": True, "skip_download": True}) as ydl:
-            res = ydl.extract_info(f"ytsearch18:{q}", download=False)
-        out = []
-        for d in (res.get("entries") or []):
-            vid = d.get("id")
-            if vid:
-                out.append((
-                    (d.get("title") or "Unknown")[:60],
-                    (d.get("channel") or d.get("uploader") or "YouTube")[:24],
-                    fmt_dur(d.get("duration", 0)),
-                    f"https://www.youtube.com/watch?v={vid}",
-                ))
-        if out:
-            return out, "YT-DLP IN-PROCESS"
-    except Exception:
-        pass
-    return [], "ALL MIRRORS FAILED"
+    return [], "SEARCH FAILED (CHECK CONNECTION)"
 
 
 def fetch_anime_feed(query: str = ""):
@@ -261,17 +269,11 @@ def fetch_anime_feed(query: str = ""):
         else:
             gql = """query { Page(perPage: 25) { media(type: ANIME, sort: TRENDING_DESC) { title { romaji english } episodes averageScore status } } }"""
             payload = json.dumps({"query": gql}).encode()
-        raw = http_json("https://graphql.anilist.co", data=payload)
+        raw = http_json("https://graphql.anilist.co", data=payload, timeout=6)
         out = []
         for it in raw["data"]["Page"]["media"]:
             t = it["title"].get("english") or it["title"].get("romaji") or "Unknown"
-            out.append((
-                t[:56],
-                str(it.get("episodes") or "?"),
-                f"{it.get('averageScore')}%" if it.get("averageScore") else "--",
-                it.get("status") or "UNKNOWN",
-                t,
-            ))
+            out.append((t[:56], str(it.get("episodes") or "?"), f"{it.get('averageScore')}%" if it.get("averageScore") else "--", it.get("status") or "UNKNOWN", t))
         if out:
             return out, "ANILIST GRAPHQL"
     except Exception:
@@ -280,37 +282,22 @@ def fetch_anime_feed(query: str = ""):
     try:
         url = f"https://api.jikan.moe/v4/anime?q={urllib.parse.quote(query)}&limit=25" if query else "https://api.jikan.moe/v4/top/anime?filter=airing&limit=25"
         out = []
-        for it in http_json(url).get("data", []):
+        for it in http_json(url, timeout=6).get("data", []):
             t = it.get("title_english") or it.get("title") or "Unknown"
-            out.append((
-                t[:56],
-                str(it.get("episodes") or "?"),
-                str(it.get("score") or "--"),
-                (it.get("status") or "AIRING")[:16],
-                t,
-            ))
+            out.append((t[:56], str(it.get("episodes") or "?"), str(it.get("score") or "--"), (it.get("status") or "AIRING")[:16], t))
         if out:
             return out, "JIKAN / MAL API"
     except Exception:
         pass
-    return [], "ALL MIRRORS FAILED"
+    return [], "ANIME MIRRORS FAILED"
 
 
 def fetch_movies_feed(query: str = ""):
     for base in YTS_MIRRORS:
         try:
             url = f"{base}/list_movies.json?query_term={urllib.parse.quote(query)}&limit=25" if query else f"{base}/list_movies.json?sort_by=download_count&limit=25"
-            movies = http_json(url).get("data", {}).get("movies") or []
-            out = [
-                (
-                    m.get("title", "Unknown")[:52],
-                    str(m.get("year", "")),
-                    f"{m.get('rating', '--')}/10",
-                    ", ".join((m.get("genres") or [])[:2])[:22],
-                    m.get("title", ""),
-                )
-                for m in movies
-            ]
+            movies = http_json(url, timeout=4).get("data", {}).get("movies") or []
+            out = [(m.get("title", "Unknown")[:52], str(m.get("year", "")), f"{m.get('rating', '--')}/10", ", ".join((m.get("genres") or [])[:2])[:22], m.get("title", "")) for m in movies]
             if out:
                 return out, f"YTS ({base.split('//')[1].split('/')[0]})"
         except Exception:
@@ -319,24 +306,17 @@ def fetch_movies_feed(query: str = ""):
     try:
         url = f"https://api.tvmaze.com/search/shows?q={urllib.parse.quote(query)}" if query else "https://api.tvmaze.com/shows?page=0"
         out = []
-        for item in http_json(url)[:25]:
+        for item in http_json(url, timeout=5)[:25]:
             s = item.get("show", item)
-            out.append((
-                s.get("name", "Unknown")[:52],
-                (s.get("premiered") or "----")[:4],
-                f"{(s.get('rating') or {}).get('average') or '--'}/10",
-                ", ".join((s.get("genres") or [])[:2])[:22],
-                s.get("name", ""),
-            ))
+            out.append((s.get("name", "Unknown")[:52], (s.get("premiered") or "----")[:4], f"{(s.get('rating') or {}).get('average') or '--'}/10", ", ".join((s.get("genres") or [])[:2])[:22], s.get("name", "")))
         if out:
             return out, "TVMAZE API"
     except Exception:
         pass
-    return [], "ALL MIRRORS FAILED"
+    return [], "MOVIE MIRRORS FAILED"
 
 
 def ping_all_mirrors() -> list[tuple[str, str, str, str]]:
-    """Concurrently pings every mirror endpoint in ~2 seconds."""
     endpoints = (
         [("YOUTUBE (PIPED)", u) for u in PIPED_MIRRORS]
         + [("YOUTUBE (INVIDIOUS)", u) for u in INVIDIOUS_MIRRORS]
@@ -351,8 +331,7 @@ def ping_all_mirrors() -> list[tuple[str, str, str, str]]:
         host = url.split("//")[1][:38]
         t0 = time.time()
         try:
-            req = urllib.request.Request(url, headers=HEADERS, method="HEAD")
-            with urllib.request.urlopen(req, timeout=3.5):
+            with urllib.request.urlopen(urllib.request.Request(url, headers=HEADERS, method="HEAD"), timeout=3.0):
                 pass
             return (svc, host, "ONLINE", f"{int((time.time() - t0) * 1000)} ms")
         except Exception:
