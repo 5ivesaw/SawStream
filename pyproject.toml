@@ -7,7 +7,7 @@ name = "sawstream"
 version = "2.4.0"
 description = "Offline-first terminal media hub for YouTube, Music, Spotify links, Anime, and Movies/TV."
 readme = "README.md"
-license = {text = "MIT"}
+license = { text = "GPL-3.0-or-later" }
 authors = [{name = "5saw", email = "5ivesaw@users.noreply.github.com"}]
 requires-python = ">=3.10"
 dependencies = [
